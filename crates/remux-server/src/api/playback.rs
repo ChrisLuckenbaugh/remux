@@ -266,6 +266,8 @@ async fn items_playbackinfo_inner(
         // FFmpeg pass. By the time the client requests a subtitle URL, the cache file
         // is already written (same approach Jellyfin uses).
         // Use effective_stream so the URL matches the stream whose track layout was probed.
+        // Skipped in Strip mode: the user has opted out of embedded subtitle handling
+        // entirely, and this pass can stall for a long time against remote sources.
         let effective_url = effective_stream
             .stream_info
             .as_ref()
@@ -273,6 +275,7 @@ async fn items_playbackinfo_inner(
                 si.descriptor
                     .server_input(effective_stream.id, port)
             });
+        if subtitle_mode != remux_sdks::remux::EmbeddedSubtitleHandling::Strip {
         if let Some(ref input_url) = effective_url {
             let text_sub_indices: Vec<i64> = source
                 .media_streams
@@ -300,6 +303,7 @@ async fn items_playbackinfo_inner(
                     ),
                 );
             }
+        }
         }
 
         // Detect embedded subtitle codecs unsupported by the client device profile.
