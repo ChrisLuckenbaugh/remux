@@ -1,13 +1,16 @@
 # Custom build: upstream v0.15.0 + homelab patches. Reuses the upstream
-# dashboard and jellyfin-web assets unmodified (both architecture-independent)
-# and only recompiles the remux-server binary.
+# jellyfin-web assets unmodified (pure JS/HTML, unaffected by our Rust
+# changes), but rebuilds the Dioxus dashboard and remux-server from our
+# patched source - the dashboard specifically CANNOT be copied from
+# upstream once its source has been edited, since upstream's compiled
+# WASM bundle wouldn't contain our changes.
 #
-# Dependency compilation is cached via cargo-chef: the `planner` stage
-# extracts just the dependency graph (recipe.json) from Cargo.toml/Cargo.lock,
-# and `cargo chef cook` builds only those dependencies, in a layer that's
-# identical across builds as long as Cargo.lock doesn't change. Combined with
-# Kaniko's --cache-repo, unrelated source-only commits skip dependency
-# recompilation entirely and only rebuild remux's own crates.
+# remux-server's dependency compilation is cached via cargo-chef: the
+# `planner` stage extracts just the dependency graph (recipe.json) from
+# Cargo.toml/Cargo.lock, and `cargo chef cook` builds only those
+# dependencies, in a layer that's identical across builds as long as
+# Cargo.lock doesn't change. Combined with Kaniko's --cache-repo,
+# unrelated source-only commits skip dependency recompilation entirely.
 
 FROM ghcr.io/lostb1t/remux:0.15.0 AS upstream
 
@@ -27,6 +30,20 @@ COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p remux-server
 COPY . .
 RUN cargo build --release -p remux-server
+
+FROM --platform=linux/amd64 rust:slim-trixie AS dashboard-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup target add wasm32-unknown-unknown
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+        | bash
+RUN cargo binstall dioxus-cli@0.7.3 --no-confirm --force
+WORKDIR /src
+COPY . .
+WORKDIR /src/crates/remux-dashboard
+RUN dx build --release
 
 FROM debian:trixie-slim
 
@@ -102,7 +119,7 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 WORKDIR /app
 
 COPY --from=builder /src/target/release/remux-server .
-COPY --from=upstream /app/dashboard ./dashboard
+COPY --from=dashboard-builder /src/target/dx/remux-dashboard/release/web/public ./dashboard
 COPY --from=upstream /app/jellyfin-web ./jellyfin-web
 
 EXPOSE 3000
