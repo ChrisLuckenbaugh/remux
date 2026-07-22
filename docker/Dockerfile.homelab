@@ -1,15 +1,30 @@
-# Custom build: upstream v0.15.0 + a fix gating background subtitle
-# pre-extraction on subtitle_mode != Strip. Reuses the upstream dashboard
-# and jellyfin-web assets unmodified (both architecture-independent) and
-# only recompiles the remux-server binary.
+# Custom build: upstream v0.15.0 + homelab patches. Reuses the upstream
+# dashboard and jellyfin-web assets unmodified (both architecture-independent)
+# and only recompiles the remux-server binary.
+#
+# Dependency compilation is cached via cargo-chef: the `planner` stage
+# extracts just the dependency graph (recipe.json) from Cargo.toml/Cargo.lock,
+# and `cargo chef cook` builds only those dependencies, in a layer that's
+# identical across builds as long as Cargo.lock doesn't change. Combined with
+# Kaniko's --cache-repo, unrelated source-only commits skip dependency
+# recompilation entirely and only rebuild remux's own crates.
 
 FROM ghcr.io/lostb1t/remux:0.15.0 AS upstream
 
-FROM --platform=linux/amd64 rust:slim-trixie AS builder
+FROM --platform=linux/amd64 rust:slim-trixie AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
 WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p remux-server
 COPY . .
 RUN cargo build --release -p remux-server
 
