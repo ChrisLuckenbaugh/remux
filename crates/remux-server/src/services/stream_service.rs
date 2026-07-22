@@ -413,6 +413,9 @@ impl StreamService {
         let timeout_p2p = probe_cfg
             .probe_timeout_p2p_secs
             .unwrap_or(60) as u64;
+        let skip_media_probe = probe_cfg
+            .skip_media_probe
+            .unwrap_or(false);
         let auto_next = probe_cfg
             .auto_next_stream_on_probe_fail
             .unwrap_or(true);
@@ -449,7 +452,7 @@ impl StreamService {
                     si.descriptor
                         .server_input(stream.id, port)
                 });
-            let skip_probe = sel.probe_only_first && idx > 0;
+            let skip_probe = skip_media_probe || (sel.probe_only_first && idx > 0);
             let was_cached = stream
                 .probe_data
                 .as_ref()

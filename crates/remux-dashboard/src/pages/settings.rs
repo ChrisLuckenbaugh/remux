@@ -758,6 +758,7 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
     let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
     let mut probe_timeout = use_signal(|| 20_i64);
     let mut probe_timeout_p2p = use_signal(|| 60_i64);
+    let mut skip_media_probe = use_signal(|| false);
     let mut auto_next_stream = use_signal(|| true);
     let mut max_fallback_streams = use_signal(|| 3_i64);
     let mut loading = use_signal(|| true);
@@ -783,6 +784,10 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
                     probe_timeout_p2p.set(
                         cfg.probe_timeout_p2p_secs
                             .unwrap_or(60),
+                    );
+                    skip_media_probe.set(
+                        cfg.skip_media_probe
+                            .unwrap_or(false),
                     );
                     auto_next_stream.set(
                         cfg.auto_next_stream_on_probe_fail
@@ -814,6 +819,7 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
         let updated = ServerConfiguration {
             probe_timeout_secs: Some(*probe_timeout.peek()),
             probe_timeout_p2p_secs: Some(*probe_timeout_p2p.peek()),
+            skip_media_probe: Some(*skip_media_probe.peek()),
             auto_next_stream_on_probe_fail: Some(*auto_next_stream.peek()),
             max_probe_fallback_streams: Some(*max_fallback_streams.peek()),
             ..cfg
@@ -876,6 +882,25 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
                                         probe_timeout_p2p.set(v);
                                     }
                                 },
+                            }
+                        }
+
+                        div { class: "field",
+                            label { class: "field-label", "Skip Media Probe" }
+                            div { class: "field-hint",
+                                "Trust the addon-supplied stream metadata (codec, container, duration, "
+                                "tracks) as-is instead of verifying it with ffprobe. Removes the probe's "
+                                "network round-trip to the source, but may produce wrong track info or "
+                                "an incorrect Direct Play decision if the addon's metadata is inaccurate. "
+                                "Off by default."
+                            }
+                            label { style: "display:flex;align-items:center;gap:8px",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: *skip_media_probe.read(),
+                                    onchange: move |e| skip_media_probe.set(e.checked()),
+                                }
+                                "Enabled"
                             }
                         }
 

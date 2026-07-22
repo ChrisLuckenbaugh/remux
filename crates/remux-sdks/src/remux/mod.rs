@@ -479,6 +479,13 @@ pub struct ServerConfiguration {
     /// Probe timeout in seconds for P2P (torrent) streams (default: 60).
     #[default(Some(60_i64))]
     pub probe_timeout_p2p_secs: Option<i64>,
+    /// Skip ffprobe entirely and trust the addon-supplied stream metadata as-is
+    /// (codec, container, duration, track layout). Removes the probe's network
+    /// round-trip to the source, at the cost of potentially wrong/missing
+    /// track info or an incorrect Direct Play decision if the addon's
+    /// self-reported metadata is inaccurate. Off by default.
+    #[default(Some(false))]
+    pub skip_media_probe: Option<bool>,
     /// When probe fails, automatically try the next stream with matching resolution and type.
     #[default(Some(true))]
     pub auto_next_stream_on_probe_fail: Option<bool>,
