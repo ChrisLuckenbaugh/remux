@@ -750,11 +750,11 @@ fn tmdb_client(
     api_key: &str,
     base_url: &str,
 ) -> Result<sdks::RestClient<sdks::BearerAuth>> {
-    Ok(
-        sdks::RestClient::new(base_url)?.with_auth(sdks::BearerAuth {
+    Ok(sdks::RestClient::new(base_url)?
+        .with_auth(sdks::BearerAuth {
             token: api_key.to_string(),
-        }),
-    )
+        })
+        .with_retry(3, 500))
 }
 
 async fn tmdb_client_from_ctx(

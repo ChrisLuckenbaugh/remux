@@ -143,6 +143,72 @@ fn send_signal(pid: u32, sig: libc::c_int) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _sig: i32) {}
 
+/// Root directory holding per-session transcode output, relative to cwd.
+/// Must match the path built in `api/hls.rs` (`transcode_sessions/{play_session_id}`).
+const TRANSCODE_SESSIONS_DIR: &str = "transcode_sessions";
+
+/// Check whether `pid` is still alive and is actually running the configured
+/// ffmpeg binary — guards against killing an unrelated process that happens
+/// to have reused a stale PID.
+#[cfg(unix)]
+fn is_running_ffmpeg_process(pid: u32) -> bool {
+    let Ok(exe_path) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let expected = std::path::Path::new(&ffmpeg_bin())
+        .file_name()
+        .map(ToOwned::to_owned);
+    exe_path.file_name().map(ToOwned::to_owned) == expected
+}
+#[cfg(not(unix))]
+fn is_running_ffmpeg_process(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    send_signal(pid, libc::SIGKILL);
+}
+#[cfg(not(unix))]
+fn kill_process(_pid: u32) {}
+
+/// Reap ffmpeg processes orphaned by a previous server instance (e.g. after
+/// a crash) and clean up their session directories.
+///
+/// Must only be called once, at startup, before any new transcode session
+/// can exist — at that point every `.pid` file under
+/// [`TRANSCODE_SESSIONS_DIR`] is guaranteed to belong to a prior process
+/// instance, not one this instance just spawned.
+pub async fn reap_orphaned_transcodes() {
+    let base = PathBuf::from(TRANSCODE_SESSIONS_DIR);
+    let Ok(mut entries) = tokio::fs::read_dir(&base).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries
+        .next_entry()
+        .await
+    {
+        let session_dir = entry.path();
+        let pid_file = session_dir.join(".pid");
+        if let Ok(pid_str) = tokio::fs::read_to_string(&pid_file).await {
+            if let Ok(pid) = pid_str
+                .trim()
+                .parse::<u32>()
+            {
+                if is_running_ffmpeg_process(pid) {
+                    warn!(
+                        pid,
+                        session_dir = %session_dir.display(),
+                        "killing orphaned ffmpeg process left by a previous server instance"
+                    );
+                    kill_process(pid);
+                }
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&session_dir).await;
+    }
+}
+
 /// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
 /// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
 fn spawn_buffer_monitor(
@@ -1309,6 +1375,9 @@ pub struct ProgressiveTranscodeParams {
     pub allow_av1_encoding: bool,
     pub h264_crf: u32,
     pub h265_crf: u32,
+    /// Hard backstop: kill the ffmpeg process if it runs longer than this,
+    /// in case the client-disconnect kill signal is ever missed.
+    pub max_duration_secs: u64,
 }
 
 /// Build the ffmpeg CLI args for a progressive transcode piped to stdout.
@@ -1682,6 +1751,12 @@ pub(crate) fn build_progressive_args(
 }
 
 /// Start a progressive transcode that returns a readable byte stream.
+///
+/// The ffmpeg process is killed either when the returned stream is dropped
+/// (e.g. the HTTP client disconnected) or after `max_duration_secs`,
+/// whichever comes first — rather than relying solely on the process
+/// noticing its stdout pipe closed (SIGPIPE), which some ffmpeg builds can
+/// ignore or delay indefinitely, leaking the process.
 pub fn start_progressive_transcode(
     params: ProgressiveTranscodeParams,
 ) -> Result<
@@ -1695,7 +1770,8 @@ pub fn start_progressive_transcode(
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     for (k, v) in env_overrides {
         cmd.env(k, v);
     }
@@ -1713,7 +1789,7 @@ pub fn start_progressive_transcode(
         .take()
         .ok_or_else(|| anyhow!("Failed to capture ffmpeg stderr"))?;
 
-    // Log stderr line-by-line at DEBUG and reap child when done.
+    // Log stderr line-by-line at DEBUG.
     tokio::spawn(async move {
         use tokio::io::AsyncBufReadExt;
         let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -1725,22 +1801,41 @@ pub fn start_progressive_transcode(
                 debug!("ffmpeg: {}", line);
             }
         }
-        match child
-            .wait()
-            .await
-        {
-            Ok(status) if !status.success() => {
-                if status.code() == Some(224) {
-                    debug!(
-                        "progressive ffmpeg exited after client disconnect: {}",
-                        status
-                    )
-                } else {
-                    error!("progressive ffmpeg exited: {}", status)
+    });
+
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    let max_duration = std::time::Duration::from_secs(params.max_duration_secs);
+    tokio::spawn(async move {
+        tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(status) if !status.success() => {
+                        if status.code() == Some(224) {
+                            debug!(
+                                "progressive ffmpeg exited after client disconnect: {}",
+                                status
+                            )
+                        } else {
+                            error!("progressive ffmpeg exited: {}", status)
+                        }
+                    }
+                    Ok(status) => debug!("progressive ffmpeg exited: {}", status),
+                    Err(e) => error!("progressive ffmpeg wait error: {}", e),
                 }
             }
-            Ok(status) => debug!("progressive ffmpeg exited: {}", status),
-            Err(e) => error!("progressive ffmpeg wait error: {}", e),
+            _ = kill_rx => {
+                debug!("progressive ffmpeg: killing after client disconnected");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            _ = tokio::time::sleep(max_duration) => {
+                warn!(
+                    "progressive ffmpeg exceeded max duration ({:?}), killing",
+                    max_duration
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
         }
     });
 
@@ -1749,7 +1844,43 @@ pub fn start_progressive_transcode(
         params.container, params.video_codec, params.audio_codec
     );
 
-    Ok(tokio_util::io::ReaderStream::new(stdout))
+    Ok(KillOnStreamDrop {
+        inner: tokio_util::io::ReaderStream::new(stdout),
+        kill_tx: Some(kill_tx),
+    })
+}
+
+/// Wraps a byte stream and fires a kill request when dropped (e.g. because
+/// the client disconnected mid-transcode and axum dropped the response
+/// body), so the backing ffmpeg process is reclaimed promptly.
+struct KillOnStreamDrop<S> {
+    inner: S,
+    kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<S> futures::Stream for KillOnStreamDrop<S>
+where
+    S: futures::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for KillOnStreamDrop<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self
+            .kill_tx
+            .take()
+        {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Generate the variant (child) HLS playlist server-side as a VOD playlist.
@@ -2012,6 +2143,27 @@ mod tests {
             .map(|w| w[1].as_str())
     }
 
+    // ── orphaned-process reaping tests ────────────────────────────────────────
+
+    #[test]
+    fn is_running_ffmpeg_process_false_for_non_ffmpeg_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child
+            .id();
+        assert!(!is_running_ffmpeg_process(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn is_running_ffmpeg_process_false_for_dead_pid() {
+        // A pid that's essentially guaranteed not to be a live process.
+        assert!(!is_running_ffmpeg_process(u32::MAX - 1));
+    }
+
     // ── select_hw_accel tests ─────────────────────────────────────────────────
 
     fn no_devices(_: &str) -> bool {
@@ -2197,6 +2349,7 @@ mod tests {
             allow_av1_encoding: false,
             h264_crf: 23,
             h265_crf: 28,
+            max_duration_secs: 14400,
         }
     }
 

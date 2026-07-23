@@ -22,13 +22,20 @@ pub fn inject_lyric_stream(source: &mut MediaSourceInfo) {
         });
 }
 
+/// Fallback ffprobe timeout for callers that don't have access to the
+/// admin-configurable `probe_timeout_secs` setting (see `db::Settings` and
+/// `services/stream_service.rs`).
+const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 20;
+
+#[async_trait::async_trait]
 pub trait MediaSourceInfoExt {
-    fn probe(&self) -> Result<MediaSourceInfo>;
-    fn probe_with_url(&self, url: &str) -> Result<MediaSourceInfo>;
+    async fn probe(&self) -> Result<MediaSourceInfo>;
+    async fn probe_with_url(&self, url: &str) -> Result<MediaSourceInfo>;
 }
 
+#[async_trait::async_trait]
 impl MediaSourceInfoExt for db::Media {
-    fn probe(&self) -> Result<MediaSourceInfo> {
+    async fn probe(&self) -> Result<MediaSourceInfo> {
         use crate::stream::StreamDescriptor;
         let url = match self
             .stream_info
@@ -42,10 +49,21 @@ impl MediaSourceInfoExt for db::Media {
             _ => return Err(anyhow::anyhow!("cannot probe this stream type directly")),
         };
         self.probe_with_url(&url)
+            .await
     }
 
-    fn probe_with_url(&self, url: &str) -> Result<MediaSourceInfo> {
-        let (mut probed, _) = crate::playback::probe::probe_media(url)?;
+    async fn probe_with_url(&self, url: &str) -> Result<MediaSourceInfo> {
+        let owned_url = url.to_string();
+        // Three `?`s: Elapsed (timeout) -> JoinError (spawn_blocking panicked)
+        // -> the anyhow::Error probe_media itself returns.
+        let (mut probed, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(DEFAULT_PROBE_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                crate::playback::probe::probe_media(&owned_url)
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ffprobe timed out"))???;
 
         probed.id = self
             .id

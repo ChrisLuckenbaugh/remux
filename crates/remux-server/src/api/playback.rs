@@ -665,7 +665,7 @@ async fn videos_stream_inner(
         } else {
             descriptor
                 .clone()
-                .into_source()
+                .into_source()?
                 .serve(&state, &headers)
                 .await?
         };
@@ -835,6 +835,10 @@ async fn videos_stream_inner(
         h265_crf: encoding_opts
             .h265_crf
             .unwrap_or(28),
+        max_duration_secs: state
+            .ctx
+            .config
+            .progressive_transcode_max_duration_secs,
     };
 
     let stream = crate::playback::engine::start_progressive_transcode(params)?;

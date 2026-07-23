@@ -57,7 +57,7 @@ pub fn fixture() -> &'static Fixture {
                 torrent_http_port: None,
                 ..Default::default()
             };
-            let (router, ctx) = init_app_with_ctx(config)
+            let (router, ctx) = init_app_with_ctx(config.resolve())
                 .await
                 .unwrap();
 

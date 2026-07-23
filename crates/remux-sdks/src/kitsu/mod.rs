@@ -54,5 +54,7 @@ impl MappingsResponse {
 }
 
 pub fn client() -> RestClient<NoAuth> {
-    RestClient::new("https://kitsu.io/api/edge/").expect("Kitsu base URL is valid")
+    RestClient::new("https://kitsu.io/api/edge/")
+        .expect("Kitsu base URL is valid")
+        .with_retry(3, 500)
 }

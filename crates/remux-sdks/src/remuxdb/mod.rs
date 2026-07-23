@@ -125,7 +125,7 @@ impl MediaInfo {
             }
         };
         debug!(url, "remuxdb: sending");
-        let mut req = reqwest::Client::new()
+        let mut req = crate::shared_http_client()
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body);

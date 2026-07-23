@@ -374,7 +374,7 @@ impl MetaAddon for StremioAddon {
     fn on_series_done(&self, meta_id: &str) {
         self.medias_cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(meta_id);
     }
 }
@@ -413,7 +413,7 @@ impl TreeAddon for StremioAddon {
                 let meta_arc = self
                     .medias_cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&meta_id)
                     .cloned();
                 let Some(meta_arc) = meta_arc else {
@@ -665,7 +665,7 @@ async fn fetch_and_cache_meta(
 
     if let Some(cached) = cache
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&meta_id)
         .cloned()
     {
@@ -716,7 +716,7 @@ async fn fetch_and_cache_meta(
     let arc = Arc::new(meta);
     cache
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(meta_id, Arc::clone(&arc));
     Ok(arc)
 }

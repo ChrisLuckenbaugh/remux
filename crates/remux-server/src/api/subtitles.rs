@@ -168,7 +168,7 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
     let (done_tx, done_rx) = watch::channel(false);
     batch_extraction_map()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(item_id, done_rx);
 
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
@@ -225,7 +225,7 @@ pub(crate) async fn pre_extract_all_subtitles_to_cache(
     let _ = done_tx.send(true);
     batch_extraction_map()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&item_id);
 }
 
@@ -346,7 +346,7 @@ pub async fn subtitles_stream(
                             }
                             _ => descriptor
                                 .clone()
-                                .into_source()
+                                .into_source()?
                                 .serve(&state, &axum::http::HeaderMap::new())
                                 .await
                                 .map_err(|e| anyhow!("{e:?}"))?,
@@ -503,7 +503,7 @@ pub async fn subtitles_stream(
         // If so, wait for it to finish rather than launching a competing FFmpeg process.
         let in_progress_rx = batch_extraction_map()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&item_id)
             .cloned();
         if let Some(mut rx) = in_progress_rx {

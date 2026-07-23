@@ -22,14 +22,14 @@ impl TransformCache {
     pub fn get(&self, path: &str) -> Option<Bytes> {
         self.0
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(path)
             .cloned()
     }
     pub fn insert(&self, path: String, bytes: Bytes) {
         self.0
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(path, bytes);
     }
 }

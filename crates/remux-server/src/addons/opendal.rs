@@ -1081,15 +1081,30 @@ async fn scan_addon(
     let mut upserted = 0usize;
 
     for (operator, list_from, path_prefix) in scan_roots {
-        let mut lister = operator
+        let mut lister = match operator
             .lister_with(&list_from)
             .recursive(true)
-            .await?;
-
-        while let Some(entry) = lister
-            .try_next()
-            .await?
+            .await
         {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(addon = %addon.name, list_from, error = %e, "opendal: failed to list root, skipping this root");
+                continue;
+            }
+        };
+
+        loop {
+            let entry = match lister
+                .try_next()
+                .await
+            {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(addon = %addon.name, list_from, error = %e, "opendal: error walking root, skipping rest of this root");
+                    break;
+                }
+            };
             if entry
                 .metadata()
                 .mode()

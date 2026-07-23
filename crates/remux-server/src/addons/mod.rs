@@ -1975,19 +1975,19 @@ impl AddonService {
             .collect();
 
         for r in addons {
-            if !r
+            let Some(search) = r
                 .search
                 .as_ref()
-                .unwrap()
+            else {
+                continue;
+            };
+            if !search
                 .search_supports(kind)
                 .await
             {
                 continue;
             }
-            match r
-                .search
-                .as_ref()
-                .unwrap()
+            match search
                 .search(kind, query, limit, ctx)
                 .await
             {
@@ -2023,10 +2023,13 @@ impl AddonService {
 
         let mut out = Vec::new();
         for r in addons {
-            match r
+            let Some(meta) = r
                 .meta
                 .as_ref()
-                .unwrap()
+            else {
+                continue;
+            };
+            match meta
                 .images_fetch(media, ctx)
                 .await
             {
@@ -2056,10 +2059,13 @@ impl AddonService {
         let mut subs = vec![];
         for r in &addons {
             debug!(addon = %r.row.name, "fetching subtitles from addon");
-            match r
+            let Some(subtitle) = r
                 .subtitle
                 .as_ref()
-                .unwrap()
+            else {
+                continue;
+            };
+            match subtitle
                 .subtitle_fetch(media, db)
                 .await
             {
@@ -2101,7 +2107,13 @@ impl AddonService {
             .into_iter()
             .map(|r| async move {
                 let name = &r.row.name;
-                match r.stream.as_ref().unwrap().get_streams(media, ctx).await {
+                let Some(stream) = r
+                    .stream
+                    .as_ref()
+                else {
+                    return vec![];
+                };
+                match stream.get_streams(media, ctx).await {
                     Ok(mut streams) => {
                         if streams.is_empty() {
                             debug!(addon = %name, "addon: no streams");

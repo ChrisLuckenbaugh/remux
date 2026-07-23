@@ -19,8 +19,36 @@ use std::{collections::HashMap, fmt, iter, ops, sync::Arc, time::Duration};
 static HTTP_CACHE: std::sync::LazyLock<Store> =
     std::sync::LazyLock::new(|| Store::new_weighted(32 * 1024 * 1024)); // 32 MB weight cap
 
-static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(reqwest::Client::new);
+static HTTP_TIMEOUT_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static SHARED_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// Default request timeout for the shared HTTP client, used if
+/// [`configure_http_timeout`] is never called (e.g. in tests).
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// Configure the timeout used by the shared HTTP client backing every
+/// `RestClient` (TMDB, Trakt, Stremio, IntroDB, Kitsu, Deezer, ...).
+///
+/// remux-sdks has no `Config`/settings system of its own, so remux-server
+/// threads its `external_api_timeout_secs` config value in here. Must be
+/// called before the first `RestClient` is constructed to take effect — a
+/// no-op once the shared client has already been built.
+pub fn configure_http_timeout(secs: u64) {
+    let _ = HTTP_TIMEOUT_SECS.set(secs);
+}
+
+fn shared_http_client() -> &'static reqwest::Client {
+    SHARED_HTTP_CLIENT.get_or_init(|| {
+        let timeout_secs = HTTP_TIMEOUT_SECS
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .expect("failed to build shared reqwest client")
+    })
+}
 
 pub fn clear_http_cache() {
     HTTP_CACHE.clear();
@@ -208,15 +236,22 @@ pub struct RestClient<A: Auth = NoAuth> {
     base: url::Url,
     auth: Arc<A>,
     map_error: fn(u16, &str, &str) -> ClientError,
+    /// `(attempts, base_delay_ms)` for transient network-level failures
+    /// (timeouts, connection resets). Opt-in via [`with_retry`] — only
+    /// idempotent metadata lookups (TMDB/Trakt/Kitsu/Deezer/IntroDB) should
+    /// set this; retrying addon/stream/scrape calls risks double-triggering
+    /// a slow upstream scraper.
+    retry: Option<(u32, u64)>,
 }
 
 impl RestClient<NoAuth> {
     pub fn new(base: &str) -> Result<Self, url::ParseError> {
         Ok(Self {
-            http: SHARED_HTTP_CLIENT.clone(),
+            http: shared_http_client().clone(),
             base: url::Url::parse(format!("{}/", base.trim_end_matches('/')).as_str())?,
             auth: Arc::new(NoAuth),
             map_error: default_error_mapper,
+            retry: None,
         })
     }
 }
@@ -228,12 +263,60 @@ impl<A: Auth + Clone> RestClient<A> {
             base: self.base,
             auth: Arc::new(auth),
             map_error: self.map_error,
+            retry: self.retry,
         }
     }
 
     pub fn with_error_mapper(mut self, f: fn(u16, &str, &str) -> ClientError) -> Self {
         self.map_error = f;
         self
+    }
+
+    /// Retry the request up to `attempts` times (with exponential backoff +
+    /// jitter, base `delay_ms`) if sending it fails at the network level
+    /// (timeout, connection reset). Does not retry on HTTP error statuses —
+    /// those are handled by the endpoint's own error mapping.
+    pub fn with_retry(mut self, attempts: u32, delay_ms: u64) -> Self {
+        self.retry = Some((attempts, delay_ms));
+        self
+    }
+
+    /// Send `req`, retrying on network-level failures per `retry` —
+    /// `(attempts, base_delay_ms)` — with exponential backoff and jitter.
+    /// Falls back to a single send if the request body can't be replayed
+    /// (e.g. a streaming body), which none of `Endpoint::body`'s variants are.
+    async fn send_with_retry(
+        req: reqwest::RequestBuilder,
+        retry: Option<(u32, u64)>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let Some((attempts, delay_ms)) = retry else {
+            return req
+                .send()
+                .await;
+        };
+        let mut last_err = None;
+        for attempt in 0..attempts.max(1) {
+            let Some(cloned) = req.try_clone() else {
+                return req
+                    .send()
+                    .await;
+            };
+            match cloned
+                .send()
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < attempts {
+                        let backoff_ms =
+                            delay_ms.saturating_mul(1u64 << attempt.min(10));
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.expect("loop runs at least once"))
     }
 
     pub async fn execute<EP: Endpoint + Clone>(
@@ -302,9 +385,7 @@ impl<A: Auth + Clone> RestClient<A> {
             Body::Text(s) => req.body(s),
             Body::Bytes(b) => req.body(b),
         };
-        let resp = req
-            .send()
-            .await?;
+        let resp = Self::send_with_retry(req, self.retry).await?;
         let status = resp
             .status()
             .as_u16();
@@ -629,5 +710,59 @@ impl From<remux::MediaType> for stremio::MediaType {
             remux::MediaType::Episode => stremio::MediaType::Series,
             _ => stremio::MediaType::Movie,
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Accepts TCP connections and immediately closes them (simulating a
+    /// flaky server), counting how many connection attempts were made.
+    async fn spawn_connection_counter() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let addr = listener
+            .local_addr()
+            .expect("failed to read test listener addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener
+                .accept()
+                .await
+            {
+                count2.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (addr, count)
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_configured_attempts_on_failure() {
+        let (addr, count) = spawn_connection_counter().await;
+        let client = reqwest::Client::new();
+        let req = client.get(format!("http://{addr}/"));
+
+        let result =
+            RestClient::<NoAuth>::send_with_retry(req, Some((3, 1))).await;
+
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_sends_once_when_retry_not_configured() {
+        let (addr, count) = spawn_connection_counter().await;
+        let client = reqwest::Client::new();
+        let req = client.get(format!("http://{addr}/"));
+
+        let result = RestClient::<NoAuth>::send_with_retry(req, None).await;
+
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

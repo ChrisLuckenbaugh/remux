@@ -117,7 +117,7 @@ pub fn collect_routes() -> axum::Router<AppState> {
     router
 }
 
-pub async fn init_app_with_config(config: Config) -> Result<Router> {
+pub async fn init_app_with_config(config: ResolvedConfig) -> Result<Router> {
     let paths = FilesystemPaths::default();
     let admin = admin_from_filesystem(
         &paths
@@ -129,7 +129,7 @@ pub async fn init_app_with_config(config: Config) -> Result<Router> {
     Ok(router)
 }
 
-pub async fn init_app_with_ctx(config: Config) -> Result<(Router, AppContext)> {
+pub async fn init_app_with_ctx(config: ResolvedConfig) -> Result<(Router, AppContext)> {
     let paths = FilesystemPaths::default();
     let admin = admin_from_filesystem(
         &paths
@@ -142,7 +142,7 @@ pub async fn init_app_with_ctx(config: Config) -> Result<(Router, AppContext)> {
 
 /// Start the HTTP server with web assets served from the filesystem.
 /// Binds to `0.0.0.0:{port}` (default 3000, or `PORT` env var).
-pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
+pub async fn serve(config: ResolvedConfig, paths: FilesystemPaths) -> Result<()> {
     let admin = admin_from_filesystem(
         &paths
             .dashboard_path
@@ -150,39 +150,110 @@ pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
     );
     let web_client = WebClientService::from_filesystem(&paths.web_path);
     let port = config.port;
-    let (router, _) = init_app(config, Some(paths), admin, web_client).await?;
-    bind_and_serve(router, port).await
+    let (router, ctx) = init_app(config, Some(paths), admin, web_client).await?;
+    bind_and_serve(router, port, ctx).await
 }
 
-pub async fn bind_and_serve(router: Router, port: u16) -> Result<()> {
+/// Waits for SIGTERM/Ctrl-C or an in-process shutdown request (see
+/// [`AppContext::request_shutdown`]), then arms a watchdog that force-exits
+/// after `grace_period` in case in-flight requests or cleanup never finish —
+/// this bounds total shutdown time for orchestrators that SIGKILL after a
+/// fixed timeout (e.g. Docker's default 10s).
+async fn shutdown_signal(shutdown_notify: Arc<tokio::sync::Notify>, grace_period: std::time::Duration) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+        _ = shutdown_notify.notified() => info!("shutdown requested, shutting down"),
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(grace_period).await;
+        error!("shutdown grace period exceeded, forcing exit");
+        std::process::exit(1);
+    });
+}
+
+pub async fn bind_and_serve(router: Router, port: u16, ctx: AppContext) -> Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let app = MapRequestLayer::new(rewrite_request_uri).layer(router);
     info!("starting webserver at {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    // Covers a container-startup race where a previous instance hasn't
+    // finished releasing the port yet.
+    let listener = remux_utils::retry! {
+        attempts: ctx.config.startup_retry_attempts,
+        delay: ctx.config.startup_retry_delay_ms,
+        { tokio::net::TcpListener::bind(&addr).await }
+    }?;
+    let grace_period =
+        std::time::Duration::from_secs(ctx.config.shutdown_grace_period_secs);
+    let shutdown_notify = ctx.shutdown_notify.clone();
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal(shutdown_notify, grace_period))
+        .await?;
+
+    info!("connections drained, running shutdown cleanup");
+    ctx.shutdown().await;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&ctx.db)
+        .await
+        .ok();
+    info!("shutdown complete");
     Ok(())
 }
 
 pub async fn init_app(
-    config: Config,
+    config: ResolvedConfig,
     web_paths: Option<FilesystemPaths>,
     admin: AdminService,
     web_client: WebClientService,
 ) -> Result<(Router, AppContext)> {
     info!("starting remux {}", env!("CARGO_PKG_VERSION"));
-    info!("config: {}", serde_json::to_string_pretty(&config).unwrap());
+    info!("config: {}", serde_json::to_string_pretty(&*config).unwrap());
 
-    let conn = db::connect(
-        config
-            .database_url
-            .as_deref()
-            .expect("Config::resolve() must be called before init_app"),
-        config.slow_query_threshold_ms,
-    )
-    .await?;
+    // Must happen before any SDK client (TMDB/Trakt/Stremio/IntroDB/...) is
+    // constructed — the shared HTTP client is built lazily on first use and
+    // this call is a no-op afterward.
+    sdks::configure_http_timeout(config.external_api_timeout_secs);
+
+    // Retries cover container-startup races (e.g. a data volume not yet
+    // mounted) rather than genuine misconfiguration.
+    let conn = remux_utils::retry! {
+        attempts: config.startup_retry_attempts,
+        delay: config.startup_retry_delay_ms,
+        {
+            db::connect(
+                config
+                    .database_url
+                    .as_deref()
+                    .expect("Config::resolve() must be called before init_app"),
+                config.slow_query_threshold_ms,
+            )
+            .await
+        }
+    }?;
 
     info!("Running database migrations. Do not interrupt!");
-    db::migrate(&conn).await?;
+    remux_utils::retry! {
+        attempts: config.startup_retry_attempts,
+        delay: config.startup_retry_delay_ms,
+        { db::migrate(&conn).await }
+    }?;
     info!("migrations complete");
 
     // Checkpoint the WAL before accepting any requests. At this point no
@@ -195,6 +266,12 @@ pub async fn init_app(
         .await
         .ok();
     crate::db::Settings::init_server_id(&conn).await?;
+
+    // Reap ffmpeg processes orphaned by a previous server instance (e.g.
+    // after a crash) before accepting any new transcode sessions.
+    if config.orphan_process_cleanup_enabled {
+        crate::playback::engine::reap_orphaned_transcodes().await;
+    }
 
     // Probe hardware and persist results at startup.
     // vaapi_driver is always re-detected (regardless of auto_detect) because
@@ -248,7 +325,7 @@ pub async fn init_app(
 
     let addons = addons::AddonService::from_db(&conn, &config).await?;
     let ctx = AppContext {
-        config,
+        config: config.into_config(),
         db: conn.clone(),
         store: Store::new_weighted(128 * 1024 * 1024),
         sessions: playback_session::PlaybackSessionManager::new("transcode_sessions"),
@@ -262,6 +339,7 @@ pub async fn init_app(
         web_paths,
         addons,
         started_at: Utc::now(),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Sync intro items at startup (best-effort; errors are logged not fatal).
@@ -331,7 +409,10 @@ pub async fn init_app(
                 })
                 .on_failure(()),
         )
-        .layer(cors);
+        .layer(cors)
+        // Outermost: a panicking handler returns 500 instead of only relying
+        // on axum/hyper's default per-connection task isolation.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
     Ok((router, ctx))
 }
@@ -350,6 +431,9 @@ pub struct AppContext {
     pub addons: addons::AddonService,
     /// When this server process started.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Notified to request a graceful server shutdown (e.g. from the
+    /// `/system/shutdown` API endpoint), same path as SIGTERM/Ctrl-C.
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AppContext {
@@ -359,6 +443,12 @@ impl AppContext {
         self.torrent
             .shutdown()
             .await;
+    }
+
+    /// Request a graceful shutdown of the server, same path as SIGTERM/Ctrl-C.
+    pub fn request_shutdown(&self) {
+        self.shutdown_notify
+            .notify_one();
     }
 }
 
@@ -437,6 +527,38 @@ pub struct Config {
     /// Base URL for remuxdb. When set, probe results are submitted after each live probe.
     #[serde(default = "default_remuxdb_url")]
     pub remuxdb_url: Option<String>,
+    /// Maximum time to wait for in-flight requests and background cleanup to
+    /// finish when shutting down (SIGTERM, Ctrl-C, or `/system/shutdown`)
+    /// before forcing the process to exit. Keep well under any orchestrator's
+    /// SIGKILL timeout (Docker defaults to 10s).
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    pub shutdown_grace_period_secs: u64,
+    /// Reap ffmpeg processes orphaned by a previous server instance (e.g.
+    /// after a crash) at startup. Disable only in unusual deployments where
+    /// this process doesn't own the ffmpeg processes under its pid namespace.
+    #[serde(default = "default_orphan_process_cleanup_enabled")]
+    pub orphan_process_cleanup_enabled: bool,
+    /// Hard backstop for progressive (non-HLS) transcodes: kill the ffmpeg
+    /// process if it runs longer than this, in case client-disconnect
+    /// detection is ever missed. Defaults to 4 hours.
+    #[serde(default = "default_progressive_transcode_max_duration_secs")]
+    pub progressive_transcode_max_duration_secs: u64,
+    /// Timeout for outbound HTTP requests to third-party metadata APIs
+    /// (TMDB, Trakt, Stremio, IntroDB, Kitsu, Deezer). Prevents a hanging
+    /// provider from stalling the request that triggered the lookup.
+    #[serde(default = "default_external_api_timeout_secs")]
+    pub external_api_timeout_secs: u64,
+    /// Retry attempts for binding the HTTP port and connecting/migrating the
+    /// database at startup — covers container-startup races (a previous
+    /// instance still releasing the port, a volume not yet mounted).
+    #[serde(default = "default_startup_retry_attempts")]
+    pub startup_retry_attempts: u32,
+    #[serde(default = "default_startup_retry_delay_ms")]
+    pub startup_retry_delay_ms: u64,
+    /// Extra whitespace-separated CLI args appended to every yt-dlp
+    /// invocation (the `ytdlp` addon).
+    #[serde(default)]
+    pub ytdlp_extra_args: Option<String>,
 }
 
 fn default_remuxdb_url() -> Option<String> {
@@ -467,9 +589,60 @@ fn default_torrent_peer_port() -> Option<u16> {
     Some(6881)
 }
 
+fn default_shutdown_grace_period_secs() -> u64 {
+    8
+}
+
+fn default_orphan_process_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_progressive_transcode_max_duration_secs() -> u64 {
+    14_400
+}
+
+fn default_external_api_timeout_secs() -> u64 {
+    10
+}
+
+fn default_startup_retry_attempts() -> u32 {
+    5
+}
+
+fn default_startup_retry_delay_ms() -> u64 {
+    1000
+}
+
+/// A [`Config`] guaranteed to have had [`Config::resolve()`] applied —
+/// `database_url`/`torrent_data_dir` are populated. Only producible via
+/// `resolve()`, so [`init_app`] and friends can require this type instead of
+/// a raw `Config` and rely on those fields being `Some` at the type level,
+/// rather than panicking at runtime if a caller forgot to resolve.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig(Config);
+
+impl std::ops::Deref for ResolvedConfig {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.0
+    }
+}
+
+impl ResolvedConfig {
+    /// Unwrap back into the plain `Config` (e.g. to store on `AppContext`).
+    pub fn into_config(self) -> Config {
+        self.0
+    }
+}
+
 impl Config {
     /// Fill in `None` fields that derive from `data_dir`. Call once after loading.
-    pub fn resolve(mut self) -> Self {
+    pub fn resolve(mut self) -> ResolvedConfig {
+        self.resolve_fields();
+        ResolvedConfig(self)
+    }
+
+    fn resolve_fields(&mut self) {
         if self
             .database_url
             .is_none()
@@ -492,13 +665,12 @@ impl Config {
                     .into_owned(),
             );
         }
-        self
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        let mut cfg = Self {
             data_dir: default_data_dir(),
             database_url: None,
             torrent_data_dir: None,
@@ -511,8 +683,17 @@ impl Default for Config {
             tmdb_base_url: default_tmdb_base_url(),
             trakt_base_url: default_trakt_base_url(),
             remuxdb_url: Some("https://remuxdb.1632022.xyz".to_string()),
-        }
-        .resolve()
+            shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
+            orphan_process_cleanup_enabled: default_orphan_process_cleanup_enabled(),
+            progressive_transcode_max_duration_secs:
+                default_progressive_transcode_max_duration_secs(),
+            external_api_timeout_secs: default_external_api_timeout_secs(),
+            startup_retry_attempts: default_startup_retry_attempts(),
+            startup_retry_delay_ms: default_startup_retry_delay_ms(),
+            ytdlp_extra_args: None,
+        };
+        cfg.resolve_fields();
+        cfg
     }
 }
 
