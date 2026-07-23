@@ -36,6 +36,9 @@ RUN cargo build --release -p remux-server \
 # (target/dx/.../web/public) stays stable and the COPY below is unambiguous.
 FROM --platform=linux/amd64 rust:slim-trixie AS dashboard-builder
 ENV CARGO_HOME=/build-cache/cargo
+# cargo-installed binaries (dx) land in $CARGO_HOME/bin; put it on PATH since
+# CARGO_HOME is no longer the image default (/usr/local/cargo/bin).
+ENV PATH="/build-cache/cargo/bin:${PATH}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
