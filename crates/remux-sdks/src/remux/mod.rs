@@ -486,6 +486,14 @@ pub struct ServerConfiguration {
     /// self-reported metadata is inaccurate. Off by default.
     #[default(Some(false))]
     pub skip_media_probe: Option<bool>,
+    /// For direct-play HTTP sources with no required request headers, return a
+    /// 302 redirect to the upstream URL instead of proxying the bytes through
+    /// remux. Lets the client connect straight to the source (e.g. a debrid
+    /// CDN), removing remux from the data path. Sources that need request
+    /// headers, and non-HTTP sources (torrents, opendal, local), always proxy.
+    /// Exposes the source URL to the client, so off by default.
+    #[default(Some(false))]
+    pub redirect_direct_play: Option<bool>,
     /// When probe fails, automatically try the next stream with matching resolution and type.
     #[default(Some(true))]
     pub auto_next_stream_on_probe_fail: Option<bool>,

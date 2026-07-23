@@ -654,6 +654,29 @@ async fn videos_stream_inner(
     if q.static_
         .unwrap_or(false)
     {
+        // Opt-in: for a plain HTTP source that needs no request headers, redirect
+        // the client straight to the upstream URL instead of proxying every byte
+        // through remux. Removes remux from the data path (client → source
+        // directly). Header-dependent sources fall through to the proxy path so
+        // their required headers are still applied.
+        if let crate::stream::StreamDescriptor::Http {
+            url,
+            request_headers,
+            ..
+        } = &descriptor
+        {
+            if request_headers.is_empty()
+                && db::Settings::get_config_or_default(&state.ctx.db)
+                    .await
+                    .redirect_direct_play
+                    .unwrap_or(false)
+            {
+                return Ok(
+                    axum::response::Redirect::temporary(url).into_response()
+                );
+            }
+        }
+
         let resp = if let Some(addon_id) = descriptor.addon_id() {
             let addon = state
                 .ctx

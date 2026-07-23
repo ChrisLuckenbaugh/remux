@@ -759,6 +759,7 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
     let mut probe_timeout = use_signal(|| 20_i64);
     let mut probe_timeout_p2p = use_signal(|| 60_i64);
     let mut skip_media_probe = use_signal(|| false);
+    let mut redirect_direct_play = use_signal(|| false);
     let mut auto_next_stream = use_signal(|| true);
     let mut max_fallback_streams = use_signal(|| 3_i64);
     let mut loading = use_signal(|| true);
@@ -787,6 +788,10 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
                     );
                     skip_media_probe.set(
                         cfg.skip_media_probe
+                            .unwrap_or(false),
+                    );
+                    redirect_direct_play.set(
+                        cfg.redirect_direct_play
                             .unwrap_or(false),
                     );
                     auto_next_stream.set(
@@ -820,6 +825,7 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
             probe_timeout_secs: Some(*probe_timeout.peek()),
             probe_timeout_p2p_secs: Some(*probe_timeout_p2p.peek()),
             skip_media_probe: Some(*skip_media_probe.peek()),
+            redirect_direct_play: Some(*redirect_direct_play.peek()),
             auto_next_stream_on_probe_fail: Some(*auto_next_stream.peek()),
             max_probe_fallback_streams: Some(*max_fallback_streams.peek()),
             ..cfg
@@ -899,6 +905,25 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
                                     r#type: "checkbox",
                                     checked: *skip_media_probe.read(),
                                     onchange: move |e| skip_media_probe.set(e.checked()),
+                                }
+                                "Enabled"
+                            }
+                        }
+
+                        div { class: "field",
+                            label { class: "field-label", "Redirect Direct-Play Streams" }
+                            div { class: "field-hint",
+                                "For direct-play HTTP sources that need no special request headers, "
+                                "redirect the player straight to the source URL instead of proxying "
+                                "the bytes through remux. Lets the client connect directly (e.g. to a "
+                                "debrid CDN), which is faster, but exposes the source URL to the client. "
+                                "Header-dependent and non-HTTP sources always proxy. Off by default."
+                            }
+                            label { style: "display:flex;align-items:center;gap:8px",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: *redirect_direct_play.read(),
+                                    onchange: move |e| redirect_direct_play.set(e.checked()),
                                 }
                                 "Enabled"
                             }
