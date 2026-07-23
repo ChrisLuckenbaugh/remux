@@ -30,6 +30,10 @@ duration-str = "0.18"
 serde_derive = "1"
 nutype = { version = "0.6", features = ["serde", "regex"] }
 regex = "1"
+tokio = { version = "^1.0", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "^1.0", features = ["net", "rt", "rt-multi-thread", "macros"] }
 
 [features]
 default = []

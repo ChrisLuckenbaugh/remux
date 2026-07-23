@@ -40,7 +40,7 @@ impl Drop for TestGuard {
 pub async fn new_test_server_with_config(
     config: Config,
 ) -> Result<(TestServer, TestGuard)> {
-    let (app, ctx) = init_app_with_ctx(config).await?;
+    let (app, ctx) = init_app_with_ctx(config.resolve()).await?;
 
     let server = TestServer::builder()
         .save_cookies()

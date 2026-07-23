@@ -3025,17 +3025,24 @@ pub async fn patch_item(
 }
 
 fn warm_providers_cache(ctx: &crate::AppContext, media: &db::Media) {
+    let media_id = media.id;
     let media = media.clone();
     let ctx = ctx.clone();
-    tokio::spawn(async move {
-        let _ = ctx
-            .addons
+    let handle = tokio::spawn(async move {
+        ctx.addons
             .fetch_subtitles(&media, &ctx.db, true, None)
             .await;
-        let _ = ctx
-            .addons
+        ctx.addons
             .fetch_segments(&media, &ctx, true)
             .await;
+    });
+    // fetch_subtitles/fetch_segments already log per-addon failures
+    // internally; this just surfaces a panic in the spawned task, which
+    // would otherwise disappear silently.
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            warn!(%media_id, error = ?e, "warm_providers_cache task panicked");
+        }
     });
 }
 

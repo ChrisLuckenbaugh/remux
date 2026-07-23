@@ -49,6 +49,65 @@ pub async fn connect(url: &str, slow_query_threshold_ms: u64) -> Result<SqlitePo
         .await?)
 }
 
+/// Whether `err` is SQLite's "database is busy/locked" error (writer lock
+/// contention), as opposed to a definite failure (constraint violation, bad
+/// SQL, etc.) that would just fail the same way again on retry.
+///
+/// Matches on the *primary* result code (masking off the extended code bits)
+/// since `sqlite3_extended_errcode` can return e.g. `SQLITE_BUSY_TIMEOUT`
+/// (773) or `SQLITE_BUSY_SNAPSHOT` (517), not just plain `SQLITE_BUSY` (5).
+pub(crate) fn is_sqlite_busy_or_locked(err: &sqlx::Error) -> bool {
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_LOCKED: i32 = 6;
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    db_err
+        .code()
+        .and_then(|c| {
+            c.parse::<i32>()
+                .ok()
+        })
+        .map(|code| matches!(code & 0xFF, SQLITE_BUSY | SQLITE_LOCKED))
+        .unwrap_or(false)
+}
+
+/// Retry `f` up to `attempts` times (exponential backoff + jitter-free delay
+/// doubling, base `delay_ms`) when it fails with [`is_sqlite_busy_or_locked`].
+///
+/// `busy_timeout` (see [`connect`]) already makes SQLite itself wait up to
+/// 10s before surfacing `SQLITE_BUSY`; this is a belt-and-suspenders layer
+/// for the rare case where even that isn't enough under heavy concurrent
+/// write load. Non-busy errors (constraint violations, bad SQL, etc.) are
+/// returned immediately without retrying, since they won't succeed on a
+/// second attempt.
+pub(crate) async fn retry_on_busy<F, Fut, T>(
+    attempts: u32,
+    delay_ms: u64,
+    mut f: F,
+) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut last_err = None;
+    for attempt in 0..attempts.max(1) {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let retryable = is_sqlite_busy_or_locked(&e);
+                last_err = Some(e);
+                if !retryable || attempt + 1 >= attempts {
+                    break;
+                }
+                let backoff_ms = delay_ms.saturating_mul(1u64 << attempt.min(10));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
 const LAST_PRE_SQUASH: i64 = 202606140004; // last migration on main before this PR
 const SQUASH_VERSION: i64 = 202606140005; // squash migration version
 
@@ -412,5 +471,96 @@ impl<'q> QueryBuilderExt<'q> for sqlx::QueryBuilder<'q, sqlx::Sqlite> {
         }
 
         self.push(")");
+    }
+}
+
+#[cfg(test)]
+mod busy_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn is_sqlite_busy_or_locked_false_for_other_errors() {
+        assert!(!is_sqlite_busy_or_locked(&sqlx::Error::RowNotFound));
+    }
+
+    #[tokio::test]
+    async fn retry_on_busy_does_not_retry_non_busy_errors() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), sqlx::Error> = retry_on_busy(3, 1, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(sqlx::Error::RowNotFound) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_on_busy_retries_configured_attempts_on_real_sqlite_busy() {
+        // Two single-connection pools sharing one on-disk DB file, both with
+        // busy_timeout=0 so contention surfaces immediately as SQLITE_BUSY
+        // instead of after SQLite's internal wait.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("busy_test.sqlite");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        async fn connect_single(url: &str) -> SqlitePool {
+            let opts = SqliteConnectOptions::from_str(url)
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_millis(0));
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap()
+        }
+
+        let holder = connect_single(&url).await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&holder)
+            .await
+            .unwrap();
+
+        // Hold the write lock open via an uncommitted IMMEDIATE transaction.
+        let mut tx = holder
+            .begin()
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t DEFAULT VALUES")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let writer = connect_single(&url).await;
+        let attempts = AtomicUsize::new(0);
+        let result: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> =
+            retry_on_busy(3, 1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let writer = &writer;
+                async move {
+                    sqlx::query("INSERT INTO t DEFAULT VALUES")
+                        .execute(writer)
+                        .await
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(is_sqlite_busy_or_locked(&result.unwrap_err()));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        // Releasing the lock lets a fresh attempt succeed.
+        tx.rollback()
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t DEFAULT VALUES")
+            .execute(&writer)
+            .await
+            .expect("insert should succeed once the lock is released");
     }
 }

@@ -620,7 +620,10 @@ pub async fn get_utc_time() -> impl IntoResponse {
 
 /// Restart the server (Admin only)
 #[post("/system/restart")]
-pub async fn system_restart(session: auth::AdminSession) -> Result<impl IntoResponse> {
+pub async fn system_restart(
+    State(state): State<AppState>,
+    session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     info!(
         "Server restart requested by user: {}",
         session
@@ -629,7 +632,7 @@ pub async fn system_restart(session: auth::AdminSession) -> Result<impl IntoResp
     );
 
     // Trigger actual server restart
-    restart_server().await?;
+    restart_server(&state.ctx).await?;
 
     Ok(Json(json!({
         "Message": "Server restart initiated",
@@ -637,8 +640,8 @@ pub async fn system_restart(session: auth::AdminSession) -> Result<impl IntoResp
     })))
 }
 
-/// Actually restart the server process
-async fn restart_server() -> Result<()> {
+/// Spawn a replacement server process, then gracefully shut down this one.
+async fn restart_server(ctx: &crate::AppContext) -> Result<()> {
     info!("Initiating server restart...");
 
     // Get the current executable path and arguments
@@ -647,30 +650,30 @@ async fn restart_server() -> Result<()> {
 
     info!("Restarting with: {:?} {:?}", current_exe, args);
 
-    // Spawn the new process
+    // Spawn the new process, inheriting this process's environment.
     let mut command = std::process::Command::new(current_exe);
     command.args(&args[1..]); // Skip the first argument (program name)
-
-    // Set environment variables from current process
-    for (key, value) in std::env::vars() {
-        command.env(key, value);
-    }
-
-    // Start the new process
     let mut child = command.spawn()?;
 
     info!("New server process started with PID: {}", child.id());
 
-    // Give the new process a moment to start
+    // Give the new process a moment to start binding its port before this
+    // one stops listening.
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Exit the current process
-    std::process::exit(0);
+    // Request a graceful shutdown of this process (same path as SIGTERM),
+    // draining in-flight requests and running startup/shutdown cleanup
+    // instead of exiting immediately.
+    ctx.request_shutdown();
+    Ok(())
 }
 
 /// Shutdown the server (Admin only)
 #[post("/system/shutdown")]
-pub async fn system_shutdown(session: auth::AdminSession) -> Result<impl IntoResponse> {
+pub async fn system_shutdown(
+    State(state): State<AppState>,
+    session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     info!(
         "Server shutdown requested by user: {}",
         session
@@ -678,27 +681,17 @@ pub async fn system_shutdown(session: auth::AdminSession) -> Result<impl IntoRes
             .username
     );
 
-    // Trigger actual server shutdown
-    shutdown_server().await?;
+    // Request a graceful shutdown (same path as SIGTERM/Ctrl-C): drains
+    // in-flight requests, stops the torrent/DHT manager, and checkpoints
+    // the WAL before the process exits.
+    state
+        .ctx
+        .request_shutdown();
 
     Ok(Json(json!({
         "Message": "Server shutdown initiated",
         "IsShuttingDown": true
     })))
-}
-
-/// Actually shutdown the server process
-async fn shutdown_server() -> Result<()> {
-    info!("Initiating server shutdown...");
-
-    // Perform graceful shutdown
-    info!("Server is shutting down gracefully");
-
-    // Give a moment for cleanup
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Exit the process
-    std::process::exit(0);
 }
 
 #[get("/system/info")]

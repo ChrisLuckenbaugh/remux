@@ -42,8 +42,9 @@ pub async fn fetch_episode_segments(
     season: i64,
     episode: i64,
 ) -> Result<MediaSegments> {
-    let client =
-        RestClient::new(BASE_URL).map_err(|e| anyhow!("introdb client error: {e}"))?;
+    let client = RestClient::new(BASE_URL)
+        .map_err(|e| anyhow!("introdb client error: {e}"))?
+        .with_retry(3, 500);
 
     let ep = EpisodeEndpoint {
         imdb_id: imdb_id.to_string(),

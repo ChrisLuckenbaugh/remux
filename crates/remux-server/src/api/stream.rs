@@ -68,7 +68,7 @@ pub async fn stream_proxy(
     }
 
     descriptor
-        .into_source()
+        .into_source()?
         .serve(&state, &headers)
         .await
 }

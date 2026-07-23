@@ -50,6 +50,11 @@ pub async fn sync_intros(ctx: &AppContext) -> Result<()> {
 
     let mut found_ids = std::collections::HashSet::new();
 
+    let probe_timeout_secs = db::Settings::get_config_or_default(&ctx.db)
+        .await
+        .probe_timeout_secs
+        .unwrap_or(20) as u64;
+
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -86,11 +91,15 @@ pub async fn sync_intros(ctx: &AppContext) -> Result<()> {
             .unwrap_or_else(|| "Intro".to_string());
 
         let url = path_str.clone();
-        let probe_result = tokio::task::spawn_blocking(move || {
-            crate::playback::probe::probe_media(&url)
-        })
+        let probe_result = tokio::time::timeout(
+            std::time::Duration::from_secs(probe_timeout_secs),
+            tokio::task::spawn_blocking(move || {
+                crate::playback::probe::probe_media(&url)
+            }),
+        )
         .await
         .ok()
+        .and_then(|r| r.ok())
         .and_then(|r| r.ok());
 
         let (runtime, probe_data) = match probe_result {

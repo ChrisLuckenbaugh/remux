@@ -553,6 +553,35 @@ pub struct MetricsStatusResponse {
     pub item_count: i64,
 }
 
+/// Health check for container orchestrators / load balancers: verifies the
+/// DB pool can still be queried. Unauthenticated (infra probes can't log
+/// in) and deliberately separate from `/system/ping`, which mirrors
+/// Jellyfin's ping exactly and must not change shape or behavior for
+/// client compatibility (see AGENTS.md).
+#[get("/remux/health")]
+pub async fn remux_health(State(state): State<AppState>) -> impl IntoResponse {
+    let db_ok = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").execute(
+            &state
+                .ctx
+                .db,
+        ),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
+
+    let status = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({ "Status": if db_ok { "Healthy" } else { "Unhealthy" } })),
+    )
+}
+
 #[get("/remux/metrics/status")]
 pub async fn remux_metrics_status(
     State(state): State<AppState>,

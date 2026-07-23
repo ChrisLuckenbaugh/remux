@@ -17,7 +17,7 @@ fn data_dir() -> PathBuf {
         .join("remux")
 }
 
-fn build_config() -> remux_server::Config {
+fn build_config() -> remux_server::ResolvedConfig {
     let base = data_dir();
     remux_server::Config {
         data_dir: base,
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     }
 }
 
-async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
+async fn serve(config: remux_server::ResolvedConfig) -> anyhow::Result<()> {
     #[cfg(all(dashboard_built, jellyfin_web_built))]
     let admin = remux_server::embedded_static::EmbeddedDir {
         dir: &DASHBOARD,
@@ -123,8 +123,8 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
     };
 
     let port = config.port;
-    let (router, _) = remux_server::init_app(config, None, admin, web_client).await?;
-    remux_server::bind_and_serve(router, port).await
+    let (router, ctx) = remux_server::init_app(config, None, admin, web_client).await?;
+    remux_server::bind_and_serve(router, port, ctx).await
 }
 
 fn load_icon() -> tray_icon::Icon {

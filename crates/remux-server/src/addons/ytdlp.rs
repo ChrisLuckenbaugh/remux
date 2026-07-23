@@ -101,6 +101,13 @@ impl AddonPreset for YtDlpPreset {
             bgutil_script_path: config
                 .bgutil_script_path
                 .clone(),
+            ytdlp_extra_args: config
+                .ytdlp_extra_args
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
         });
         Ok(AddonCapabilities {
             kind: Some(addon.clone()),
@@ -152,14 +159,7 @@ pub struct YtDlpAddon {
     cookies: Option<String>,
     executable: PathBuf,
     bgutil_script_path: PathBuf,
-}
-
-fn ytdlp_extra_args() -> Vec<String> {
-    std::env::var("YTDLP_EXTRA_ARGS")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
+    ytdlp_extra_args: Vec<String>,
 }
 
 impl YtDlpAddon {
@@ -387,7 +387,7 @@ impl YtDlpAddon {
                 url_or_query,
             ])
             .args(self.cookies_args())
-            .args(ytdlp_extra_args())
+            .args(self.ytdlp_extra_args.clone())
             .args(self.bgutil_args())
             .output()
             .await
@@ -476,7 +476,7 @@ impl YtDlpAddon {
                 url_or_query,
             ])
             .args(self.cookies_args())
-            .args(ytdlp_extra_args())
+            .args(self.ytdlp_extra_args.clone())
             .args(self.bgutil_args())
             .output()
             .await
@@ -538,7 +538,7 @@ impl YtDlpAddon {
                 &url,
             ])
             .args(self.cookies_args())
-            .args(ytdlp_extra_args())
+            .args(self.ytdlp_extra_args.clone())
             .args(self.bgutil_args())
             .output()
             .await
@@ -687,7 +687,7 @@ impl YtDlpAddon {
                 &search_url,
             ])
             .args(self.cookies_args())
-            .args(ytdlp_extra_args())
+            .args(self.ytdlp_extra_args.clone())
             .args(self.bgutil_args())
             .output()
             .await
@@ -748,7 +748,7 @@ impl YtDlpAddon {
                             &url,
                         ])
                         .args(&cookies_args)
-                        .args(ytdlp_extra_args())
+                        .args(self.ytdlp_extra_args.clone())
                         .args(self.bgutil_args())
                         .output()
                         .await

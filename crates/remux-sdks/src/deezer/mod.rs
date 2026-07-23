@@ -311,5 +311,7 @@ impl Endpoint for PlaylistEndpoint {
 // ---------------------------------------------------------------------------
 
 pub fn client() -> RestClient<NoAuth> {
-    RestClient::new("https://api.deezer.com/").expect("Deezer base URL is valid")
+    RestClient::new("https://api.deezer.com/")
+        .expect("Deezer base URL is valid")
+        .with_retry(3, 500)
 }

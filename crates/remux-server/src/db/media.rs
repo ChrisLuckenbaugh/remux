@@ -3,6 +3,8 @@ use super::{FilterResult, ImageKind, MediaImage, MediaImages, QueryBuilderExt};
 pub const CHUNK_SIZE: usize = 250;
 const SQLITE_VAR_LIMIT: usize = 999;
 
+// Never `.close()`d, so `.acquire().await.unwrap()` at call sites below can
+// never actually panic — `Semaphore::acquire` only errors once closed.
 static DB_WRITE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
 use crate::{
@@ -411,33 +413,41 @@ impl MediaRelation {
             .acquire()
             .await
             .unwrap();
-        let mut tx = db
-            .begin()
-            .await?;
 
-        for chunk in items.chunks(CHUNK_SIZE) {
-            let mut qb = sqlx::QueryBuilder::new(
-                "INSERT INTO media_relations (relation_id, left_media_id, right_media_id, weight, role, character) ",
-            );
-
-            qb.push_values(chunk.iter(), |mut b, item| {
-                b.push_bind(&item.relation_id)
-                    .push_bind(&item.left_media_id)
-                    .push_bind(&item.right_media_id)
-                    .push_bind(&item.weight)
-                    .push_bind(&item.role)
-                    .push_bind(&item.character);
-            });
-
-            qb.push(" ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight, character = excluded.character");
-
-            qb.build()
-                .execute(&mut *tx)
+        // Retried as a whole on SQLITE_BUSY/LOCKED: a failed `commit()`
+        // consumes the sqlx `Transaction` (auto-rolling it back on drop), so
+        // there's no way to retry just the commit — the entire
+        // begin/insert/commit sequence must be redone from scratch.
+        crate::db::retry_on_busy(2, 25, || async {
+            let mut tx = db
+                .begin()
                 .await?;
-        }
 
-        tx.commit()
-            .await?;
+            for chunk in items.chunks(CHUNK_SIZE) {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "INSERT INTO media_relations (relation_id, left_media_id, right_media_id, weight, role, character) ",
+                );
+
+                qb.push_values(chunk.iter(), |mut b, item| {
+                    b.push_bind(&item.relation_id)
+                        .push_bind(&item.left_media_id)
+                        .push_bind(&item.right_media_id)
+                        .push_bind(&item.weight)
+                        .push_bind(&item.role)
+                        .push_bind(&item.character);
+                });
+
+                qb.push(" ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight, character = excluded.character");
+
+                qb.build()
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            tx.commit()
+                .await
+        })
+        .await?;
         Ok(())
     }
 
@@ -475,17 +485,20 @@ impl MediaRelation {
             .await
             .unwrap();
         for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
-            let mut qb = sqlx::QueryBuilder::new(
-                "DELETE FROM media_relations WHERE left_media_id IN (",
-            );
-            let mut sep = qb.separated(", ");
-            for id in chunk {
-                sep.push_bind(id);
-            }
-            qb.push(")");
-            qb.build()
-                .execute(db)
-                .await?;
+            crate::db::retry_on_busy(2, 25, || async {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "DELETE FROM media_relations WHERE left_media_id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id);
+                }
+                qb.push(")");
+                qb.build()
+                    .execute(db)
+                    .await
+            })
+            .await?;
         }
         Ok(())
     }
@@ -522,17 +535,20 @@ impl MediaRelation {
             .await
             .unwrap();
         for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
-            let mut qb = sqlx::QueryBuilder::new(
-                "DELETE FROM media_relations WHERE relation_id IN (",
-            );
-            let mut sep = qb.separated(", ");
-            for id in chunk {
-                sep.push_bind(id);
-            }
-            qb.push(")");
-            qb.build()
-                .execute(db)
-                .await?;
+            crate::db::retry_on_busy(2, 25, || async {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "DELETE FROM media_relations WHERE relation_id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id);
+                }
+                qb.push(")");
+                qb.build()
+                    .execute(db)
+                    .await
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1970,6 +1986,11 @@ impl Media {
                 .acquire()
                 .await
                 .unwrap();
+            // Retried as a whole on SQLITE_BUSY/LOCKED: a failed `commit()`
+            // consumes the sqlx `Transaction` (auto-rolling it back on
+            // drop), so the entire begin/insert/commit sequence must be
+            // redone from scratch rather than retrying just the commit.
+            crate::db::retry_on_busy(2, 25, || async {
             let mut tx = db
                 .begin()
                 .await?;
@@ -2118,7 +2139,9 @@ impl Media {
             }
 
             tx.commit()
-                .await?;
+                .await
+            })
+            .await?;
         }
 
         Ok(())

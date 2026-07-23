@@ -112,36 +112,40 @@ impl StreamDescriptor {
     }
 
     /// Instantiate the runtime service for self-contained variants.
-    /// Do **not** call this for `Opendal` — those must go through the addon.
-    pub fn into_source(self) -> Box<dyn StreamSource> {
+    ///
+    /// Returns an error for `Rtsp` (must go through the transcode path) and
+    /// `Opendal` (must go through the owning addon) rather than panicking —
+    /// callers reach this from request handlers, so a descriptor mismatch
+    /// should surface as a normal error response, not take down the request.
+    pub fn into_source(self) -> anyhow::Result<Box<dyn StreamSource>> {
         match self {
             Self::Http {
                 url,
                 request_headers,
                 response_headers,
-            } => Box::new(HttpSource {
+            } => Ok(Box::new(HttpSource {
                 url,
                 request_headers,
                 response_headers,
-            }),
-            Self::Local(path) => Box::new(LocalSource { path }),
+            })),
+            Self::Local(path) => Ok(Box::new(LocalSource { path })),
             Self::Torrent {
                 info_hash,
                 file_hint,
                 file_idx,
                 trackers,
-            } => Box::new(TorrentSource {
+            } => Ok(Box::new(TorrentSource {
                 info_hash,
                 file_hint,
                 file_idx,
                 trackers,
-            }),
-            Self::Rtsp { .. } => {
-                panic!("Rtsp descriptors must be served through the transcode path")
-            }
-            Self::Opendal { .. } => {
-                panic!("Opendal descriptors must be served through their addon")
-            }
+            })),
+            Self::Rtsp { .. } => Err(anyhow::anyhow!(
+                "Rtsp descriptors must be served through the transcode path"
+            )),
+            Self::Opendal { .. } => Err(anyhow::anyhow!(
+                "Opendal descriptors must be served through their addon"
+            )),
         }
     }
 }
