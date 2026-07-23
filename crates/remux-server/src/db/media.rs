@@ -2186,28 +2186,27 @@ impl Media {
             return Ok((vec![], 0));
         }
 
-        // Build the similarity query using QueryBuilder throughout — never embed
-        // raw `?` placeholders in the initial string, as push_bind appends its
-        // own markers and the pre-baked ones would cause a syntax error.
-        let base = "SELECT m.id, COUNT(DISTINCT mr.right_media_id) as score \
-                    FROM media m \
-                    JOIN media_relations mr ON mr.left_media_id = m.id \
-                    JOIN media g ON g.id = mr.right_media_id \
-                    WHERE m.kind = ";
+        // Drive from media_relations using idx_media_relations_right_left so we
+        // only visit rows that share one of the target genres, then join to media
+        // by primary key to filter by kind. genre_ids are already filtered to
+        // genre/music_genre kinds by the query above, so no JOIN back to media g
+        // is needed.
+        let base = "SELECT mr.left_media_id as id, COUNT(DISTINCT mr.right_media_id) as score \
+                    FROM media_relations mr \
+                    JOIN media m ON m.id = mr.left_media_id AND m.kind = ";
 
         // Count total.
         let mut count_qb =
             sqlx::QueryBuilder::new(format!("SELECT COUNT(*) FROM ({} ", base));
         count_qb.push_bind(&kind_str);
-        count_qb
-            .push(" AND g.kind IN ('genre', 'music_genre') AND mr.right_media_id IN (");
+        count_qb.push(" AND m.id != ");
+        count_qb.push_bind(source_id);
+        count_qb.push(" WHERE mr.right_media_id IN (");
         let mut sep = count_qb.separated(", ");
         for gid in &genre_ids {
             sep.push_bind(*gid);
         }
-        count_qb.push(") AND m.id != ");
-        count_qb.push_bind(source_id);
-        count_qb.push(" GROUP BY m.id) sub");
+        count_qb.push(") GROUP BY mr.left_media_id) sub");
         let total: i64 = count_qb
             .build_query_scalar()
             .fetch_one(db)
@@ -2216,14 +2215,14 @@ impl Media {
         // Fetch scored page.
         let mut qb = sqlx::QueryBuilder::new(base);
         qb.push_bind(&kind_str);
-        qb.push(" AND g.kind IN ('genre', 'music_genre') AND mr.right_media_id IN (");
+        qb.push(" AND m.id != ");
+        qb.push_bind(source_id);
+        qb.push(" WHERE mr.right_media_id IN (");
         let mut sep = qb.separated(", ");
         for gid in &genre_ids {
             sep.push_bind(*gid);
         }
-        qb.push(") AND m.id != ");
-        qb.push_bind(source_id);
-        qb.push(" GROUP BY m.id ORDER BY score DESC LIMIT ");
+        qb.push(") GROUP BY mr.left_media_id ORDER BY score DESC LIMIT ");
         qb.push_bind(limit as i64);
         qb.push(" OFFSET ");
         qb.push_bind(offset as i64);
@@ -2533,19 +2532,18 @@ impl Media {
                 );
                 records_qb.push_bind(uid);
                 records_qb.push(" AND media.id = dp.media_id AND 1=1");
-            } else if let Some(period) = pop_period {
-                // Materialise the latest per-media popularity score once and JOIN it in
-                // so ORDER BY uses a plain column reference instead of N correlated
-                // subqueries — one per qualifying row before LIMIT is applied.
+            } else if pop_period.is_some() {
                 pop_joined = true;
-                records_qb = sqlx::QueryBuilder::new(format!(
-                    "SELECT media.* FROM media \
-                     LEFT JOIN popularity_agg pop \
-                       ON pop.media_id = media.id \
-                      AND pop.period = '{period}' \
-                      AND pop.latest = 1 \
-                     WHERE 1=1"
-                ));
+                // Build a CTE over the media table so the WHERE conditions loop
+                // below can fill it once. After the loop we close the CTE and
+                // wrap it in a UNION ALL: arm 1 drives from idx_pop_agg_covering
+                // (scored items in avg-DESC order via the index walk), arm 2
+                // streams unscored items via NOT EXISTS. SQLite evaluates UNION ALL
+                // arms as coroutines — no global sort, LIMIT stops after arm 1 if
+                // there are enough scored items.
+                records_qb = sqlx::QueryBuilder::new(
+                    "WITH filtered AS (SELECT media.* FROM media WHERE 1=1",
+                );
             } else {
                 records_qb = sqlx::QueryBuilder::new("SELECT * FROM media WHERE 1=1");
             }
@@ -2968,16 +2966,26 @@ impl Media {
                 .as_ref()
             {
                 if resumable_ids.is_none() {
-                    let season_only = filter
+                    // Parent fallback (correlated subquery to parent row) is only
+                    // meaningful for episodes that have no own air date and must
+                    // inherit the series premiere. For Movie/Series/Track/etc.
+                    // parent_id is NULL so the subquery always returns NULL — it's
+                    // pure overhead. Enable only when the query may include episodes.
+                    let needs_parent_fallback = filter
                         .kind
                         .as_ref()
                         .map(|k| {
-                            !k.is_empty()
-                                && k.iter()
-                                    .all(|k| matches!(k, MediaKind::Season))
+                            k.is_empty()
+                                || k.iter()
+                                    .any(|k| matches!(k, MediaKind::Episode))
                         })
-                        .unwrap_or(false);
-                    push_release_date_filter(qb, "media", threshold, !season_only);
+                        .unwrap_or(true);
+                    push_release_date_filter(
+                        qb,
+                        "media",
+                        threshold,
+                        needs_parent_fallback,
+                    );
                 }
             }
 
@@ -3010,6 +3018,32 @@ impl Media {
                 }
             }
         }
+
+        // Close the filtered CTE and build the UNION ALL structure.
+        // Arm 1 joins popularity_agg → filtered driving from idx_pop_agg_covering,
+        // producing scored items in avg-DESC order without a sort step.
+        // Arm 2 streams unscored items after arm 1 is exhausted.
+        if pop_joined {
+            let period = pop_period.unwrap();
+            // CROSS JOIN forces popularity_agg as the outer loop (SQLite docs:
+            // "CROSS JOIN prevents the optimizer from rearranging table order").
+            // This guarantees SQLite walks idx_pop_agg_covering in avg-DESC order
+            // and probes the filtered CTE by PK, producing scored items in score
+            // order without a sort step.
+            records_qb.push(format!(
+                ") SELECT m.* FROM (\
+                 SELECT f.* FROM popularity_agg pop CROSS JOIN filtered f \
+                 WHERE f.id = pop.media_id AND pop.period = '{period}' AND pop.latest = 1 \
+                 UNION ALL \
+                 SELECT f.* FROM filtered f \
+                 WHERE NOT EXISTS (\
+                     SELECT 1 FROM popularity_agg p \
+                     WHERE p.media_id = f.id AND p.period = '{period}' AND p.latest = 1\
+                 )\
+                ) m"
+            ));
+        }
+
         // Apply ORDER BY driven by the sort_by field, with per-kind fallbacks.
         let is_channel_query = filter
             .kind
@@ -3181,8 +3215,13 @@ impl Media {
                     col
                 })
                 .collect();
-            records_qb.push(" ORDER BY ");
-            records_qb.push(order_clauses.join(", "));
+            // When pop_joined, ordering is handled inside the UNION ALL arms —
+            // arm 1 walks idx_pop_agg_covering in avg-DESC order, arm 2 follows.
+            // Pushing ORDER BY here would force a global sort over the whole result.
+            if !pop_joined {
+                records_qb.push(" ORDER BY ");
+                records_qb.push(order_clauses.join(", "));
+            }
         } else if is_manual_collection {
             records_qb.push(" ORDER BY mr.weight ASC");
         } else if filter.sort_by_channel_order {
@@ -5188,6 +5227,11 @@ impl From<sdks::stremio::Stream> for Media {
             addon_id: None,
             catchup_source: None,
             catchup_days: None,
+            usenet_guid: None,
+            usenet_indexer: None,
+            nzb_url: None,
+            torrent_info_hash: None,
+            torrent_file_idx: None,
         });
 
         // Merge name + description: AIOStreams puts the provider/addon name in `name`
@@ -5809,31 +5853,28 @@ pub fn stremio_meta_season_episodes(
     Ok(out)
 }
 
-/// Return the release-date WHERE fragment for use in raw `format!` SQL strings.
 /// Push the release-date WHERE condition onto a query builder, binding `threshold`.
 ///
 /// `alias` is the table alias for the media row (e.g. `"media"` for an unaliased
 /// table, `"e"` when episodes are selected as `media e`).
 ///
-/// Appends a WHERE condition that hides items whose resolved release date is after `threshold`.
-///
-/// Resolution priority (CASE expression):
+/// Hides items whose resolved release date is after `threshold`. Resolution priority:
 /// 1. `digital_released_at` — explicit digital/streaming date; used as-is.
-/// 2. Movies with `released_at` within the past year → NULL (hidden). A recent
-///    theatrical release with no digital date confirmed is still considered
-///    unreleased digitally. TV air dates remain valid release dates for episodes.
+/// 2. Movies with `released_at` within the past year and no digital date → hidden.
+///    A recent theatrical release with no confirmed digital date is still considered
+///    unreleased digitally. TV air dates remain valid for episodes.
 /// 3. ELSE — depends on `use_parent_fallback`:
-///    - `true`  (episodes, series, movies): fall back to the parent row's dates via a
-///      correlated subquery. This lets undated episodes of old series (e.g. a 1990s
-///      show imported from Jellyfin with no per-episode air dates) inherit the series
-///      premiere and be treated as released rather than silently disappearing.
-///    - `false` (seasons): no parent fallback. A season with no own dates returns NULL
-///      from the CASE, which fails `<= threshold` and is hidden. This is intentional:
-///      TVDB often lists upcoming seasons before scheduling them, and we must not let
-///      such a season inherit the series' past premiere date and slip through the filter.
+///    - `true`  (episodes): fall back to the parent row's dates via a correlated
+///      subquery so undated episodes of old series inherit the series premiere.
+///    - `false` (movies, series, seasons): use `released_at` directly. Movies and
+///      series have NULL parent_id so the subquery would always return NULL anyway;
+///      seasons must not inherit the series premiere (TVDB lists future seasons early).
 ///
-/// In all cases a NULL result from the CASE is falsy in SQLite (`NULL <= x` = NULL),
-/// so items that cannot resolve any date are excluded.
+/// Items with no resolvable date are always excluded (the OR condition is false for them).
+///
+/// The filter is expressed as OR branches rather than a CASE expression so that SQLite
+/// can use `idx_media_digital_released_at` for branch 1 and `idx_media_released_at`
+/// for branch 2, avoiding a full table scan.
 pub fn push_release_date_filter(
     qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
     alias: &str,
@@ -5841,24 +5882,44 @@ pub fn push_release_date_filter(
     use_parent_fallback: bool,
 ) {
     let a = format!("{alias}.");
-    let else_expr = if use_parent_fallback {
-        format!(
-            "COALESCE(\
-              {a}released_at, \
-              (SELECT COALESCE(p.digital_released_at, p.released_at) FROM media p WHERE p.id = {a}parent_id)\
-            )"
-        )
+    if use_parent_fallback {
+        // Episodes: branch 2 falls back to the parent row's date when released_at
+        // is NULL. The correlated subquery is cheap here because the episode set
+        // is already narrow (filtered by parent_id / season).
+        qb.push(format!(
+            " AND (({a}digital_released_at IS NOT NULL AND {a}digital_released_at <= "
+        ))
+        .push_bind(threshold)
+        .push(format!(
+            ") OR ({a}digital_released_at IS NULL \
+              AND NOT ({a}kind = 'movie' AND {a}released_at IS NOT NULL AND {a}released_at > date('now', '-1 year')) \
+              AND COALESCE({a}released_at, \
+                (SELECT COALESCE(p.digital_released_at, p.released_at) FROM media p WHERE p.id = {a}parent_id) \
+              ) IS NOT NULL \
+              AND COALESCE({a}released_at, \
+                (SELECT COALESCE(p.digital_released_at, p.released_at) FROM media p WHERE p.id = {a}parent_id) \
+              ) <= "
+        ))
+        .push_bind(threshold)
+        .push("))");
     } else {
-        format!("{a}released_at")
-    };
-    qb.push(format!(
-        " AND CASE \
-            WHEN {a}digital_released_at IS NOT NULL THEN {a}digital_released_at \
-            WHEN {a}kind = 'movie' AND {a}released_at IS NOT NULL AND datetime({a}released_at) > datetime('now', '-1 year') THEN NULL \
-            ELSE {else_expr} \
-          END <= "
-    ))
-    .push_bind(threshold);
+        // Movies / series / seasons: no parent fallback. Each branch is indexable.
+        // Branch 1 → idx_media_digital_released_at
+        // Branch 2 → idx_media_released_at
+        qb.push(format!(
+            " AND (({a}digital_released_at IS NOT NULL AND {a}digital_released_at <= "
+        ))
+        .push_bind(threshold)
+        .push(format!(
+            ") OR ({a}digital_released_at IS NULL \
+              AND {a}released_at IS NOT NULL \
+              AND {a}released_at <= "
+        ))
+        .push_bind(threshold)
+        .push(format!(
+            " AND NOT ({a}kind = 'movie' AND {a}released_at > date('now', '-1 year'))))"
+        ));
+    }
 }
 
 /// Append WHERE clauses for a set of `FilterRule`s onto a query builder.
