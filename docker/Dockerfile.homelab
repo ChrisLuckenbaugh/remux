@@ -5,33 +5,37 @@
 # upstream once its source has been edited, since upstream's compiled
 # WASM bundle wouldn't contain our changes.
 #
-# remux-server's dependency compilation is cached via cargo-chef: the
-# `planner` stage extracts just the dependency graph (recipe.json) from
-# Cargo.toml/Cargo.lock, and `cargo chef cook` builds only those
-# dependencies, in a layer that's identical across builds as long as
-# Cargo.lock doesn't change. Combined with Kaniko's --cache-repo,
-# unrelated source-only commits skip dependency recompilation entirely.
+# Rust build caching is done via a persistent PVC mounted at /build-cache
+# in the Kaniko pod (excluded from image snapshots with Kaniko's
+# --ignore-path=/build-cache). CARGO_HOME (downloaded crates, shared) and
+# CARGO_TARGET_DIR (compiled artifacts) point into it, so cargo's own
+# incremental compilation reuses unchanged dependency artifacts across
+# builds — source-only commits recompile only remux's own crates. This
+# replaces the cargo-chef layer approach, which Kaniko's layer cache
+# never reliably hit.
 
 FROM ghcr.io/lostb1t/remux:0.15.0 AS upstream
 
-FROM --platform=linux/amd64 rust:slim-trixie AS chef
+# --- Server binary -----------------------------------------------------------
+FROM --platform=linux/amd64 rust:slim-trixie AS builder
+ENV CARGO_HOME=/build-cache/cargo
+ENV CARGO_TARGET_DIR=/build-cache/target-server
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
 WORKDIR /src
-
-FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+# Copy the binary out of the (snapshot-ignored) cache to a tracked path so the
+# final stage's COPY --from=builder works regardless of --ignore-path.
+RUN cargo build --release -p remux-server \
+    && cp "$CARGO_TARGET_DIR/release/remux-server" /remux-server
 
-FROM chef AS builder
-COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p remux-server
-COPY . .
-RUN cargo build --release -p remux-server
-
+# --- Dashboard (WASM) --------------------------------------------------------
+# Shares CARGO_HOME (crate downloads) with the server build via the PVC, but
+# keeps CARGO_TARGET_DIR at the default /src/target so dx's bundled output path
+# (target/dx/.../web/public) stays stable and the COPY below is unambiguous.
 FROM --platform=linux/amd64 rust:slim-trixie AS dashboard-builder
+ENV CARGO_HOME=/build-cache/cargo
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -118,7 +122,7 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 
 WORKDIR /app
 
-COPY --from=builder /src/target/release/remux-server .
+COPY --from=builder /remux-server .
 COPY --from=dashboard-builder /src/target/dx/remux-dashboard/release/web/public ./dashboard
 COPY --from=upstream /app/jellyfin-web ./jellyfin-web
 
