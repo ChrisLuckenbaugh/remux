@@ -43,8 +43,15 @@ fn shared_http_client() -> &'static reqwest::Client {
             .get()
             .copied()
             .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
+        let builder = reqwest::Client::builder();
+        // reqwest's wasm backend (browser fetch) has no ClientBuilder::timeout;
+        // the configured timeout only applies on native targets (remux-server).
+        // remux-sdks is also compiled to wasm32 for the dashboard.
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.timeout(Duration::from_secs(timeout_secs));
+        #[cfg(target_arch = "wasm32")]
+        let _ = timeout_secs;
+        builder
             .build()
             .expect("failed to build shared reqwest client")
     })
