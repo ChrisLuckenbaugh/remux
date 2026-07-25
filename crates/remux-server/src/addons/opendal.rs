@@ -736,60 +736,65 @@ impl StreamAddon for OpendalAddon {
         let file_size = meta.content_length();
         let content_type = crate::stream::mime_from_path(std::path::Path::new(path));
 
-        let range_str = headers
+        let spec = headers
             .get(http::header::RANGE)
             .and_then(|v| {
                 v.to_str()
                     .ok()
             })
-            .map(str::to_owned);
+            .map(|range| crate::stream::parse_range(range, file_size))
+            .unwrap_or(crate::stream::RangeSpec::Ignore);
 
-        if let Some(range) = range_str {
-            let (start, end) = crate::stream::parse_range(&range, file_size)
-                .context_bad_request("invalid Range header")?;
-            let length = end - start + 1;
+        match spec {
+            crate::stream::RangeSpec::Unsatisfiable => {
+                Ok(crate::stream::range_not_satisfiable(file_size))
+            }
+            crate::stream::RangeSpec::Satisfiable { start, end } => {
+                let length = end - start + 1;
 
-            let reader = self
-                .operator
-                .reader_with(path)
-                .await
-                .context_bad_request("failed to open opendal reader")?;
-            let bytes_stream = reader
-                .into_bytes_stream(start..start + length)
-                .await
-                .context_bad_request("failed to create opendal byte stream")?
-                .map_err(io::Error::other);
+                let reader = self
+                    .operator
+                    .reader_with(path)
+                    .await
+                    .context_bad_request("failed to open opendal reader")?;
+                let bytes_stream = reader
+                    .into_bytes_stream(start..start + length)
+                    .await
+                    .context_bad_request("failed to create opendal byte stream")?
+                    .map_err(io::Error::other);
 
-            Ok(axum::response::Response::builder()
-                .status(http::StatusCode::PARTIAL_CONTENT)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, length)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .header(
-                    http::header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                )
-                .body(Body::from_stream(bytes_stream))
-                .unwrap())
-        } else {
-            let reader = self
-                .operator
-                .reader(path)
-                .await
-                .context_bad_request("failed to open opendal reader")?;
-            let bytes_stream = reader
-                .into_bytes_stream(..)
-                .await
-                .context_bad_request("failed to create opendal byte stream")?
-                .map_err(io::Error::other);
+                Ok(axum::response::Response::builder()
+                    .status(http::StatusCode::PARTIAL_CONTENT)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, length)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .header(
+                        http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .body(Body::from_stream(bytes_stream))
+                    .unwrap())
+            }
+            crate::stream::RangeSpec::Ignore => {
+                let reader = self
+                    .operator
+                    .reader(path)
+                    .await
+                    .context_bad_request("failed to open opendal reader")?;
+                let bytes_stream = reader
+                    .into_bytes_stream(..)
+                    .await
+                    .context_bad_request("failed to create opendal byte stream")?
+                    .map_err(io::Error::other);
 
-            Ok(axum::response::Response::builder()
-                .status(http::StatusCode::OK)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, file_size)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .body(Body::from_stream(bytes_stream))
-                .unwrap())
+                Ok(axum::response::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, file_size)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .body(Body::from_stream(bytes_stream))
+                    .unwrap())
+            }
         }
     }
 }

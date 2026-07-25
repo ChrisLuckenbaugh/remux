@@ -3,12 +3,25 @@ use async_trait::async_trait;
 use axum::{body::Body, http::HeaderMap, response::Response};
 use axum_anyhow::ApiResult as Result;
 use futures_util::TryStreamExt;
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, sync::OnceLock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::AppState;
+
+/// Shared client for proxying direct-play range requests to HTTP/torrent
+/// upstreams. Reused across requests so a seek doesn't pay a fresh TCP+TLS
+/// handshake every time — a single Infuse playback session can issue dozens
+/// of range requests as it scrubs.
+fn http_source_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
 
 /// Typed representation of how a stream is accessed (transport mechanism).
 ///
@@ -279,7 +292,8 @@ impl TorrentSource {
 #[async_trait]
 impl StreamSource for HttpSource {
     async fn serve(&self, _state: &AppState, headers: &HeaderMap) -> Result<Response> {
-        let mut req = reqwest::Client::new().get(&self.url);
+        let had_range = headers.contains_key(http::header::RANGE);
+        let mut req = http_source_client().get(&self.url);
         if let Some(v) = headers.get(http::header::RANGE) {
             req = req.header(http::header::RANGE, v.clone());
         }
@@ -322,6 +336,19 @@ impl StreamSource for HttpSource {
                 http::HeaderValue::from_static("application/octet-stream"),
             );
         }
+        // The upstream may honor Range without advertising Accept-Ranges (or
+        // may not send Range-related headers at all on a 200). If it actually
+        // answered a range request with 206, or we know it's byte-addressable
+        // via Content-Range, tell the client it can seek.
+        if !out.contains_key(http::header::ACCEPT_RANGES)
+            && (status == http::StatusCode::PARTIAL_CONTENT
+                || (had_range && out.contains_key(http::header::CONTENT_RANGE)))
+        {
+            out.insert(
+                http::header::ACCEPT_RANGES,
+                http::HeaderValue::from_static("bytes"),
+            );
+        }
 
         Ok(resp)
     }
@@ -340,47 +367,50 @@ impl StreamSource for LocalSource {
         let file_size = metadata.len();
         let content_type = mime_from_path(&self.path);
 
-        let range_str = headers
+        let spec = headers
             .get(http::header::RANGE)
             .and_then(|v| {
                 v.to_str()
                     .ok()
             })
-            .map(str::to_owned);
+            .map(|range| parse_range(range, file_size))
+            .unwrap_or(RangeSpec::Ignore);
 
-        if let Some(range) = range_str {
-            let (start, end) = parse_range(&range, file_size)
-                .context_bad_request("invalid Range header")?;
-            let length = end - start + 1;
+        match spec {
+            RangeSpec::Unsatisfiable => Ok(range_not_satisfiable(file_size)),
+            RangeSpec::Satisfiable { start, end } => {
+                let length = end - start + 1;
 
-            let mut file = file;
-            file.seek(std::io::SeekFrom::Start(start))
-                .await
-                .context_bad_request("seek failed")?;
+                let mut file = file;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .context_bad_request("seek failed")?;
 
-            let body = Body::from_stream(ReaderStream::new(file.take(length)));
+                let body = Body::from_stream(ReaderStream::new(file.take(length)));
 
-            Ok(Response::builder()
-                .status(http::StatusCode::PARTIAL_CONTENT)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, length)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .header(
-                    http::header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                )
-                .body(body)
-                .unwrap())
-        } else {
-            let body = Body::from_stream(ReaderStream::new(file));
+                Ok(Response::builder()
+                    .status(http::StatusCode::PARTIAL_CONTENT)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, length)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .header(
+                        http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .body(body)
+                    .unwrap())
+            }
+            RangeSpec::Ignore => {
+                let body = Body::from_stream(ReaderStream::new(file));
 
-            Ok(Response::builder()
-                .status(http::StatusCode::OK)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, file_size)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .body(body)
-                .unwrap())
+                Ok(Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, file_size)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .body(body)
+                    .unwrap())
+            }
         }
     }
 }
@@ -405,29 +435,107 @@ impl StreamSource for TorrentSource {
     }
 }
 
-pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
-    let bytes = range
-        .strip_prefix("bytes=")
-        .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
-    let (start_str, end_str) = bytes
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("malformed range"))?;
+/// The outcome of interpreting a `Range` header against a known content length.
+///
+/// Parsing resolves the header all the way to a decision so callers cannot
+/// accidentally build a partial response from bounds that do not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeSpec {
+    /// A satisfiable single range with inclusive bounds (`start <= end < size`).
+    Satisfiable { start: u64, end: u64 },
+    /// Syntactically valid but not satisfiable for this content length; the
+    /// caller must answer 416 rather than clamping into a bogus range.
+    Unsatisfiable,
+    /// No usable range: the whole representation should be sent with 200.
+    Ignore,
+}
 
-    if start_str.is_empty() {
-        let suffix: u64 = end_str.parse()?;
-        return Ok((file_size.saturating_sub(suffix), file_size - 1));
+impl RangeSpec {
+    /// Byte count covered by a satisfiable range.
+    pub fn length(&self) -> Option<u64> {
+        match *self {
+            Self::Satisfiable { start, end } => Some(end - start + 1),
+            _ => None,
+        }
     }
+}
 
-    let start: u64 = start_str.parse()?;
-    let end: u64 = if end_str.is_empty() {
-        file_size - 1
-    } else {
-        end_str
-            .parse::<u64>()?
-            .min(file_size - 1)
+/// Interprets a `Range` header against `file_size`.
+///
+/// Deviations from a naive parse, all required by RFC 9110 §14.1.2 and relied on
+/// by AVFoundation clients (Infuse) that probe with edge and suffix ranges:
+///
+/// - A malformed or non-`bytes` range is *ignored* (full 200), never an error.
+/// - A start at or past the end is unsatisfiable (416), never a clamped range.
+/// - A zero-length representation cannot satisfy any range.
+/// - Multi-range requests are answered with their first range only; a multipart
+///   body buys nothing for players that seek linearly.
+pub fn parse_range(range: &str, file_size: u64) -> RangeSpec {
+    let Some(spec) = range
+        .trim()
+        .strip_prefix("bytes=")
+    else {
+        return RangeSpec::Ignore;
     };
 
-    Ok((start, end))
+    let first = spec
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let Some((start_str, end_str)) = first.split_once('-') else {
+        return RangeSpec::Ignore;
+    };
+    let (start_str, end_str) = (start_str.trim(), end_str.trim());
+
+    // Nothing can be served from an empty representation.
+    if file_size == 0 {
+        return RangeSpec::Unsatisfiable;
+    }
+    let last = file_size - 1;
+
+    // Suffix form `bytes=-N`: the final N bytes. `bytes=-0` requests nothing.
+    if start_str.is_empty() {
+        return match end_str.parse::<u64>() {
+            Ok(0) => RangeSpec::Unsatisfiable,
+            Ok(suffix) => RangeSpec::Satisfiable {
+                start: file_size.saturating_sub(suffix),
+                end: last,
+            },
+            Err(_) => RangeSpec::Ignore,
+        };
+    }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return RangeSpec::Ignore;
+    };
+    let end = if end_str.is_empty() {
+        last
+    } else {
+        match end_str.parse::<u64>() {
+            Ok(end) => end.min(last),
+            Err(_) => return RangeSpec::Ignore,
+        }
+    };
+
+    if start > last || start > end {
+        return RangeSpec::Unsatisfiable;
+    }
+
+    RangeSpec::Satisfiable { start, end }
+}
+
+/// 416 response carrying the content length so the client can retry correctly.
+pub fn range_not_satisfiable(file_size: u64) -> Response {
+    Response::builder()
+        .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(
+            http::header::CONTENT_RANGE,
+            format!("bytes */{}", file_size),
+        )
+        .body(Body::empty())
+        .unwrap()
 }
 
 pub fn mime_from_path(path: &std::path::Path) -> &'static str {
@@ -440,7 +548,12 @@ pub fn mime_from_path(path: &std::path::Path) -> &'static str {
         Some("avi") => "video/x-msvideo",
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
-        Some("ts") => "video/mp2t",
+        Some("ts") | Some("m2ts") | Some("mts") | Some("m2t") => "video/mp2t",
+        Some("mpg") | Some("mpeg") | Some("m2v") | Some("vob") => "video/mpeg",
+        Some("wmv") | Some("asf") => "video/x-ms-wmv",
+        Some("flv") => "video/x-flv",
+        Some("3gp") => "video/3gpp",
+        Some("ogv") => "video/ogg",
         Some("mp3") => "audio/mpeg",
         Some("flac") => "audio/flac",
         Some("aac") => "audio/aac",
@@ -470,4 +583,128 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
         .query_pairs()
         .find(|(k, _)| k == param)
         .map(|(_, v)| v.into_owned())
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    const SIZE: u64 = 5_000_000;
+
+    #[test]
+    fn full_range() {
+        assert_eq!(
+            parse_range("bytes=0-", SIZE),
+            RangeSpec::Satisfiable {
+                start: 0,
+                end: SIZE - 1
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_range() {
+        assert_eq!(
+            parse_range("bytes=0-1", SIZE),
+            RangeSpec::Satisfiable { start: 0, end: 1 }
+        );
+    }
+
+    #[test]
+    fn end_beyond_size_is_clamped() {
+        assert_eq!(
+            parse_range("bytes=0-99999999999", SIZE),
+            RangeSpec::Satisfiable {
+                start: 0,
+                end: SIZE - 1
+            }
+        );
+    }
+
+    #[test]
+    fn suffix_range() {
+        assert_eq!(
+            parse_range("bytes=-1000", SIZE),
+            RangeSpec::Satisfiable {
+                start: SIZE - 1000,
+                end: SIZE - 1
+            }
+        );
+    }
+
+    #[test]
+    fn suffix_larger_than_file_returns_whole_file() {
+        assert_eq!(
+            parse_range("bytes=-99999999999", SIZE),
+            RangeSpec::Satisfiable {
+                start: 0,
+                end: SIZE - 1
+            }
+        );
+    }
+
+    #[test]
+    fn suffix_zero_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=-0", SIZE), RangeSpec::Unsatisfiable);
+    }
+
+    /// The bug this whole module exists to prevent: a start at or past EOF
+    /// used to underflow `end - start + 1` into a ~2^64 Content-Length
+    /// instead of failing cleanly.
+    #[test]
+    fn start_at_file_size_is_unsatisfiable_not_underflow() {
+        assert_eq!(
+            parse_range(&format!("bytes={}-", SIZE), SIZE),
+            RangeSpec::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn start_past_file_size_is_unsatisfiable() {
+        assert_eq!(
+            parse_range(&format!("bytes={}-", SIZE + 1000), SIZE),
+            RangeSpec::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn start_after_end_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=100-50", SIZE), RangeSpec::Unsatisfiable);
+    }
+
+    #[test]
+    fn zero_byte_file_is_always_unsatisfiable() {
+        assert_eq!(parse_range("bytes=0-", 0), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), RangeSpec::Unsatisfiable);
+    }
+
+    /// RFC 9110 §14.1.2: a malformed Range must be ignored, not rejected —
+    /// the server falls back to serving the full 200 response.
+    #[test]
+    fn malformed_range_is_ignored() {
+        assert_eq!(parse_range("nonsense", SIZE), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=", SIZE), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=abc-def", SIZE), RangeSpec::Ignore);
+        assert_eq!(parse_range("items=0-1", SIZE), RangeSpec::Ignore);
+    }
+
+    /// A multi-range request is answered with its first range rather than
+    /// rejected outright.
+    #[test]
+    fn multi_range_uses_first_range() {
+        assert_eq!(
+            parse_range("bytes=0-1,4096-8191", SIZE),
+            RangeSpec::Satisfiable { start: 0, end: 1 }
+        );
+    }
+
+    #[test]
+    fn length_helper() {
+        assert_eq!(
+            RangeSpec::Satisfiable { start: 0, end: 99 }.length(),
+            Some(100)
+        );
+        assert_eq!(RangeSpec::Unsatisfiable.length(), None);
+        assert_eq!(RangeSpec::Ignore.length(), None);
+    }
 }
