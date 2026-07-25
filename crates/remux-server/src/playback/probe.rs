@@ -46,6 +46,29 @@ fn normalize_lang(code: &str) -> &str {
     }
 }
 
+/// Decides whether an audio stream at ordinal `audio_idx` should be marked
+/// `IsDefault`, given whether *any* audio stream in the source carries the
+/// container's own default disposition flag.
+///
+/// When the container flags a default, that flag wins outright. When it
+/// doesn't (common for files muxed without explicit dispositions), the first
+/// audio track (ordinal 0) is used as a fallback — a player always needs an
+/// audio track selected, unlike subtitles which are fine with none selected.
+///
+/// Pulled out as a pure function so this policy is unit-testable without
+/// shelling out to ffprobe.
+fn is_default_audio_stream(
+    has_default_audio_disposition: bool,
+    stream_disposition_default: bool,
+    audio_idx: i64,
+) -> bool {
+    if has_default_audio_disposition {
+        stream_disposition_default
+    } else {
+        audio_idx == 0
+    }
+}
+
 fn first_to_upper(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -226,6 +249,9 @@ pub(crate) fn display_title_subtitle(m: &StreamMeta) -> Option<String> {
         attrs.push("External".into());
     }
 
+    if let Some(title) = m.title {
+        return Some(append_tags_to_title(title, &attrs));
+    }
     if attrs.is_empty() {
         None
     } else {
@@ -482,6 +508,23 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
     let mut audio_idx: i64 = 0;
     let mut sub_idx: i64 = 0;
 
+    // Whether *any* audio track carries the container's default disposition
+    // flag. If none does, we fall back to "first audio track" so a player
+    // always has something to select. Subtitles get no such fallback below —
+    // a file with no default-flagged subtitle should start with none
+    // selected, matching Jellyfin, rather than always forcing the first one.
+    let has_default_audio_disposition = probe
+        .streams
+        .iter()
+        .any(|s| {
+            s.codec_type
+                .as_deref()
+                == Some("audio")
+                && s.disposition
+                    .default
+                    != 0
+        });
+
     for s in &probe.streams {
         let codec_type = s
             .codec_type
@@ -637,7 +680,13 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     .parse::<AudioCodec>()
                     .unwrap()
                     .to_string();
-                let is_default = audio_idx == 0;
+                let is_default = is_default_audio_stream(
+                    has_default_audio_disposition,
+                    s.disposition
+                        .default
+                        != 0,
+                    audio_idx,
+                );
                 let is_forced = s
                     .disposition
                     .forced
@@ -713,7 +762,13 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                 } else {
                     None
                 };
-                let is_default = sub_idx == 0;
+                // No ordinal fallback here (unlike audio): a file with no
+                // subtitle track flagged default in its container should
+                // start with no subtitle selected, not the first one found.
+                let is_default = s
+                    .disposition
+                    .default
+                    != 0;
                 let is_forced = s
                     .disposition
                     .forced
@@ -736,7 +791,7 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                     is_forced,
                     is_external: false,
                     is_hearing_impaired,
-                    title: None, // don't use raw stream title; build purely from attributes
+                    title: title.as_deref(),
                 };
 
                 streams.push(api::MediaStream {
@@ -770,13 +825,23 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
         }
     }
 
+    // These follow the `is_default` computed per-stream above: audio always
+    // has exactly one true (container flag, or first-track fallback), while
+    // subtitle has none unless the container itself flagged one — so no
+    // subtitle is auto-selected on files that don't ask for it.
     let default_audio_stream_index = streams
         .iter()
-        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Audio)))
+        .find(|s| {
+            matches!(s.type_, Some(api::MediaStreamType::Audio))
+                && s.is_default == Some(true)
+        })
         .map(|s| s.index);
     let default_subtitle_stream_index = streams
         .iter()
-        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Subtitle)))
+        .find(|s| {
+            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                && s.is_default == Some(true)
+        })
         .map(|s| s.index);
 
     let segments = chapters_to_segments(&probe.chapters);
@@ -1600,5 +1665,112 @@ mod probe_tests {
                 sibling.id
             );
         }
+    }
+
+    // --- IsDefault audio-track selection policy ---
+    //
+    // These exercise `is_default_audio_stream` directly rather than through
+    // `probe_media` (which shells out to a real ffprobe binary and isn't
+    // available in this test environment).
+
+    #[test]
+    fn audio_default_flag_wins_when_container_flags_one() {
+        // Container flagged track 1 as default (not track 0) — the flag
+        // must win over ordinal position.
+        assert!(!is_default_audio_stream(true, false, 0));
+        assert!(is_default_audio_stream(true, true, 1));
+    }
+
+    #[test]
+    fn audio_falls_back_to_first_track_when_container_flags_none() {
+        // No track anywhere in the source carries the default disposition —
+        // ordinal 0 must win so a player has something selected.
+        assert!(is_default_audio_stream(false, false, 0));
+        assert!(!is_default_audio_stream(false, false, 1));
+        assert!(!is_default_audio_stream(false, false, 2));
+    }
+
+    /// Full `probe_media` pipeline, exercised without ffprobe by feeding a
+    /// pre-built `MediaSourceInfo` through the same default-index derivation
+    /// used at the end of `probe_media` (streams already carrying the
+    /// per-stream `IsDefault` this module computes).
+    #[test]
+    fn default_stream_indices_follow_is_default_not_ordinal() {
+        use remux_sdks::remux::{MediaStream, MediaStreamType};
+
+        let streams = vec![
+            MediaStream {
+                index: 0,
+                type_: Some(MediaStreamType::Audio),
+                is_default: Some(false),
+                ..Default::default()
+            },
+            MediaStream {
+                index: 1,
+                type_: Some(MediaStreamType::Audio),
+                is_default: Some(true), // container flagged this one
+                ..Default::default()
+            },
+            MediaStream {
+                index: 2,
+                type_: Some(MediaStreamType::Subtitle),
+                is_default: Some(false), // no subtitle flagged default
+                ..Default::default()
+            },
+        ];
+
+        let default_audio_stream_index = streams
+            .iter()
+            .find(|s| {
+                matches!(s.type_, Some(MediaStreamType::Audio))
+                    && s.is_default == Some(true)
+            })
+            .map(|s| s.index);
+        let default_subtitle_stream_index = streams
+            .iter()
+            .find(|s| {
+                matches!(s.type_, Some(MediaStreamType::Subtitle))
+                    && s.is_default == Some(true)
+            })
+            .map(|s| s.index);
+
+        assert_eq!(
+            default_audio_stream_index,
+            Some(1),
+            "must follow the container's flagged track, not ordinal 0"
+        );
+        assert_eq!(
+            default_subtitle_stream_index, None,
+            "no subtitle track was flagged default — none should be auto-selected"
+        );
+    }
+
+    /// An embedded subtitle track's own title (e.g. "Signs & Songs") must
+    /// survive into DisplayTitle, not just the synthesized language/codec
+    /// attributes — otherwise every named track looks identical in a
+    /// client's track picker.
+    #[test]
+    fn subtitle_display_title_includes_embedded_track_title() {
+        let meta = StreamMeta {
+            language: Some("eng"),
+            codec: Some("subrip"),
+            profile: None,
+            channels: None,
+            channel_layout: None,
+            width: None,
+            height: None,
+            video_range: None,
+            is_default: false,
+            is_forced: false,
+            is_external: false,
+            is_hearing_impaired: false,
+            title: Some("Signs & Songs"),
+        };
+
+        let display = display_title_subtitle(&meta).expect("display title");
+        assert!(
+            display.contains("Signs & Songs"),
+            "embedded title must survive into DisplayTitle, got: {display}"
+        );
     }
 }
