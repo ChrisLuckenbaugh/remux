@@ -539,7 +539,14 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
+        // The MediaBrowser/Emby Authorization header always carries device
+        // metadata (Client, Device, DeviceId, Version) but does not always
+        // carry a Token — Infuse, for one, sends it token-less and puts the
+        // token in a separate X-Emby-Token header or an `api_key` query
+        // param. Parse it for the metadata, but only treat it as the final
+        // answer once a token is actually found; otherwise keep falling
+        // through the other token sources and merge the metadata back in.
+        let header_meta = parts
             .headers
             .get(http::header::AUTHORIZATION)
             .or_else(|| {
@@ -551,9 +558,15 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
                 v.to_str()
                     .ok()
             })
-            .and_then(|raw| JellyfinAuthHeader::from_str(raw).ok())
-        {
-            return Ok(auth);
+            .and_then(|raw| JellyfinAuthHeader::from_str(raw).ok());
+
+        if let Some(ref auth) = header_meta {
+            if auth
+                .token
+                .is_some()
+            {
+                return Ok(auth.clone());
+            }
         }
 
         // Try X-Emby / MediaBrowser token headers
@@ -569,36 +582,116 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
                 v.to_str()
                     .ok()
             })
-            .map(|s| s.to_string());
-
-        if let Some(token) = token {
-            return Ok(JellyfinAuthHeader {
-                token: Some(token),
-                ..Default::default()
+            .map(|s| s.to_string())
+            // Query params fallback
+            .or_else(|| {
+                parts
+                    .uri
+                    .query()
+                    .and_then(|query| {
+                        query
+                            .split('&')
+                            .find_map(|pair| {
+                                let mut kv = pair.splitn(2, '=');
+                                let (key, val) = (kv.next()?, kv.next()?);
+                                (key.eq_ignore_ascii_case("api_key")
+                                    || key.eq_ignore_ascii_case("apikey")
+                                    || key.eq_ignore_ascii_case("token"))
+                                .then(|| val.to_string())
+                            })
+                    })
             });
-        }
 
-        // Query params fallback
-        if let Some(query) = parts
-            .uri
-            .query()
-        {
-            for pair in query.split('&') {
-                let mut kv = pair.splitn(2, '=');
-                if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                    if key.eq_ignore_ascii_case("api_key")
-                        || key.eq_ignore_ascii_case("apikey")
-                        || key.eq_ignore_ascii_case("token")
-                    {
-                        return Ok(JellyfinAuthHeader {
-                            token: Some(val.to_string()),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-        }
+        Ok(JellyfinAuthHeader {
+            token,
+            ..header_meta.unwrap_or_default()
+        })
+    }
+}
 
-        Ok(JellyfinAuthHeader::default())
+#[cfg(test)]
+mod tests {
+    use crate::integration_test::{authenticated_server, new_test_server};
+    use http::{StatusCode, header::HeaderValue};
+
+    /// Infuse (and other Emby-lineage clients) sends a token-less
+    /// `Authorization: MediaBrowser ...` header carrying only device
+    /// metadata, with the actual access token in `X-Emby-Token`. This used
+    /// to 401 because the Authorization header short-circuited the
+    /// extractor before the token headers were ever consulted.
+    #[tokio::test]
+    async fn token_less_auth_header_falls_back_to_x_emby_token() {
+        let (server, _guard, token) = authenticated_server().await;
+
+        let resp = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(
+                    "MediaBrowser Client=\"Infuse\", Device=\"Apple TV\", DeviceId=\"infuse-atv\", Version=\"8.0\"",
+                ),
+            )
+            .add_header(
+                "X-Emby-Token",
+                HeaderValue::from_str(&token).unwrap(),
+            )
+            .await;
+
+        resp.assert_status(StatusCode::OK);
+    }
+
+    /// Same scenario, but the token arrives via `?api_key=` (used on
+    /// image/stream URLs) instead of a header.
+    #[tokio::test]
+    async fn token_less_auth_header_falls_back_to_api_key_query_param() {
+        let (server, _guard, token) = authenticated_server().await;
+
+        let resp = server
+            .get(&format!("/users/me?api_key={}", token))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(
+                    "MediaBrowser Client=\"Infuse\", Device=\"Apple TV\", DeviceId=\"infuse-atv\", Version=\"8.0\"",
+                ),
+            )
+            .await;
+
+        resp.assert_status(StatusCode::OK);
+    }
+
+    /// A fully-populated MediaBrowser header (Token included) still works
+    /// as the sole source of truth — no regression for existing clients.
+    #[tokio::test]
+    async fn auth_header_with_token_still_authenticates_directly() {
+        let (server, _guard, token) = authenticated_server().await;
+
+        let resp = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "MediaBrowser Client=\"Infuse\", Device=\"Apple TV\", DeviceId=\"infuse-atv\", Version=\"8.0\", Token=\"{}\"",
+                    token
+                ))
+                .unwrap(),
+            )
+            .await;
+
+        resp.assert_status(StatusCode::OK);
+    }
+
+    /// No auth at all must still 401 — the fallback chain must not become
+    /// permissive.
+    #[tokio::test]
+    async fn no_auth_still_unauthorized() {
+        let (server, _ctx) = new_test_server()
+            .await
+            .unwrap();
+
+        server
+            .get("/users/me")
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 }
