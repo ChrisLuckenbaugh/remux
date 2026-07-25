@@ -516,11 +516,32 @@ impl Default for Config {
     }
 }
 
+/// Strips a leading `/emby`-style path-segment prefix, case-insensitively.
+///
+/// Some clients (and reverse proxies mimicking Emby's app path) prefix every
+/// request with `/emby` or `/Emby`; scoped to a genuine leading path
+/// *segment* — not a bare substring search — so it can't mangle a path that
+/// merely contains "emby" elsewhere (e.g. a library item literally named
+/// "Emby"), and case-insensitive because clients disagree on casing here.
+fn strip_emby_prefix(path: &str) -> &str {
+    const PREFIX: &str = "/emby";
+    if path.len() < PREFIX.len() || !path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return path;
+    }
+    match path[PREFIX.len()..]
+        .chars()
+        .next()
+    {
+        None => "",
+        Some('/') => &path[PREFIX.len()..],
+        // "/embyfoo" — not actually the /emby prefix, just shares the letters.
+        _ => path,
+    }
+}
+
 pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
     let uri = req.uri();
-    let mut path = uri
-        .path()
-        .replace("/emby", "");
+    let mut path = strip_emby_prefix(uri.path()).to_string();
     if path.is_empty() {
         path = "/".to_string();
     }
@@ -582,6 +603,70 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
 
     *req.uri_mut() = new_uri;
     req
+}
+
+#[cfg(test)]
+mod uri_rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn strips_lowercase_emby_prefix() {
+        assert_eq!(strip_emby_prefix("/emby/System/Info"), "/System/Info");
+    }
+
+    /// This is the actual gap the old `String::replace("/emby", "")` had:
+    /// it only ever matched a lowercase literal, so a client (or reverse
+    /// proxy) sending `/Emby/...` fell straight through to a 404 instead of
+    /// being routed like the lowercase form.
+    #[test]
+    fn strips_mixed_case_emby_prefix() {
+        assert_eq!(strip_emby_prefix("/Emby/System/Info"), "/System/Info");
+        assert_eq!(strip_emby_prefix("/EMBY/Users/Me"), "/Users/Me");
+    }
+
+    #[test]
+    fn bare_emby_root_becomes_empty() {
+        assert_eq!(strip_emby_prefix("/emby"), "");
+        assert_eq!(strip_emby_prefix("/Emby"), "");
+    }
+
+    /// The old implementation was a global `String::replace`, so it would
+    /// mangle a path that merely *contains* "emby" anywhere — including
+    /// mid-path, not just as the leading segment. The fix only strips a
+    /// genuine leading `/emby` segment.
+    #[test]
+    fn does_not_strip_embedded_or_partial_matches() {
+        assert_eq!(
+            strip_emby_prefix("/Items/embyshow123"),
+            "/Items/embyshow123"
+        );
+        assert_eq!(strip_emby_prefix("/embyfoo/bar"), "/embyfoo/bar");
+        assert_eq!(strip_emby_prefix("/notemby/emby/x"), "/notemby/emby/x");
+    }
+
+    #[test]
+    fn path_without_emby_prefix_is_unchanged() {
+        assert_eq!(strip_emby_prefix("/Users/Me"), "/Users/Me");
+        assert_eq!(strip_emby_prefix("/"), "/");
+    }
+
+    fn rewritten_path(path_and_query: &str) -> String {
+        let req = http::Request::builder()
+            .uri(path_and_query)
+            .body(())
+            .unwrap();
+        rewrite_request_uri(req)
+            .uri()
+            .to_string()
+    }
+
+    #[test]
+    fn full_rewrite_handles_mixed_case_emby_prefix_end_to_end() {
+        assert_eq!(
+            rewritten_path("/Emby/Users/AuthenticateByName"),
+            "/users/authenticatebyname"
+        );
+    }
 }
 
 pub fn setup_logging() {
