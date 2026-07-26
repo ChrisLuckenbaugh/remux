@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: remux
+  labels:
+    app.kubernetes.io/name: remux
+spec:
+  selector:
+    app.kubernetes.io/name: remux
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

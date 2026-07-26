@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: remux-data
+  labels:
+    app.kubernetes.io/name: remux
+spec:
+  # Single-replica Deployment with strategy Recreate → RWO is sufficient.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Holds the SQLite database, image/metadata cache and torrent data.
+      # Size to your torrent_data_dir usage.
+      storage: 50Gi
+  # storageClassName: your-storage-class
