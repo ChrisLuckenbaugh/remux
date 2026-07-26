@@ -153,7 +153,7 @@ impl TaskResult {
             r#"
             SELECT *
             FROM task_results
-            WHERE task_id = ?1
+            WHERE task_id = ?1 COLLATE NOCASE
             ORDER BY end_at DESC
             LIMIT 1
             "#,

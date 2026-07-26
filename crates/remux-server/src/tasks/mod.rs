@@ -499,6 +499,11 @@ impl TaskService {
     }
 
     pub async fn run_startup_tasks(&self) -> Result<()> {
+        // Startup triggers replay on every process start, and frequent
+        // redeploys meant a full library refresh (with its upstream addon
+        // fan-out) per restart. Skip tasks that already completed recently.
+        const SKIP_IF_COMPLETED_WITHIN_HOURS: i64 = 6;
+
         let triggers = db::TaskTrigger::get_all(
             &self
                 .ctx
@@ -506,10 +511,33 @@ impl TaskService {
         )
         .await?;
         for trigger in triggers {
-            if trigger.kind == TaskTriggerInfoType::StartupTrigger {
-                self.run_task(&trigger.task_id)
-                    .await?;
+            if trigger.kind != TaskTriggerInfoType::StartupTrigger {
+                continue;
             }
+            let last = db::TaskResult::get_by_task_id(
+                &self
+                    .ctx
+                    .db,
+                &trigger.task_id,
+            )
+            .await
+            .ok()
+            .flatten();
+            if let Some(last) = last {
+                if matches!(last.status, db::TaskResultStatus::Completed)
+                    && (Utc::now().naive_utc() - last.end_at).num_hours()
+                        < SKIP_IF_COMPLETED_WITHIN_HOURS
+                {
+                    info!(
+                        task = %trigger.task_id,
+                        completed_at = %last.end_at,
+                        "skipping startup task, completed recently"
+                    );
+                    continue;
+                }
+            }
+            self.run_task(&trigger.task_id)
+                .await?;
         }
         Ok(())
     }
