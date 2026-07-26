@@ -922,6 +922,17 @@ impl Stream {
         !(path == "/" || path.is_empty())
     }
 
+    /// Addons like AIOStreams surface upstream failures (rate limits,
+    /// timeouts) as fake streams whose name carries an error marker, mirroring
+    /// [`Meta::is_error`].
+    pub fn is_error(&self) -> bool {
+        let name = self
+            .name
+            .as_deref()
+            .unwrap_or_default();
+        name.starts_with("[✗]") || name.starts_with("[❌]") || name.starts_with("[X]")
+    }
+
     pub fn id(&self) -> String {
         self.info_hash()
             .unwrap()

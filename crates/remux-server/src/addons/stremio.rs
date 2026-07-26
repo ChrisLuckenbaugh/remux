@@ -325,6 +325,13 @@ impl CatalogAddon for StremioAddon {
                 let svc = svc.clone();
                 let tmdb = tmdb_client.clone();
                 async move {
+                    // Addons like AIOStreams surface upstream failures (e.g.
+                    // rate limits) as fake "[❌] ..." metas; never import them
+                    // as library items.
+                    if meta.is_error() {
+                        warn!(id = %meta.id, name = ?meta.get_name(), "catalog returned an error meta, skipping");
+                        return vec![];
+                    }
                     if !resolve_imdb_id(&mut meta, Some(&svc), tmdb.as_ref()).await {
                         debug!(id = %meta.id, "could not resolve imdb_id, skipping");
                         return vec![];
@@ -1318,6 +1325,24 @@ async fn stremio_streams(
         }
         Err(e) => return Err(e),
     };
+
+    let (errors, streams): (Vec<_>, Vec<_>) = streams
+        .into_iter()
+        .partition(|s| s.is_error());
+    if !errors.is_empty() {
+        warn!(
+            count = errors.len(),
+            name = errors[0]
+                .name
+                .as_deref()
+                .unwrap_or_default(),
+            description = errors[0]
+                .description
+                .as_deref()
+                .unwrap_or_default(),
+            "addon returned error streams, dropping"
+        );
+    }
 
     Ok(streams
         .into_iter()
