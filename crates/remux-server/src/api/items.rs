@@ -188,13 +188,13 @@ pub async fn get_items(
         .parent_id
         .clone()
     {
-        db::Media::get_by_id(
-            &state
-                .ctx
-                .db,
-            &parent_id,
-        )
-        .await?
+        let resolved = MediaResolveService::resolve_item(parent_id, &state.ctx).await?;
+        if let Some(ref m) = resolved {
+            if m.id != parent_id {
+                q.parent_id = Some(m.id);
+            }
+        }
+        resolved
     } else {
         None
     };
@@ -799,14 +799,11 @@ pub async fn items_flat(
         .parent_id
         .clone()
     {
-        if let Ok(Some(parent)) = db::Media::get_by_id(
-            &state
-                .ctx
-                .db,
-            &parent_id,
-        )
-        .await
-        {
+        let resolved = MediaResolveService::resolve_item(parent_id, &state.ctx).await?;
+        if let Some(ref parent) = resolved {
+            if parent.id != parent_id {
+                q.parent_id = Some(parent.id);
+            }
             if parent.collection_latest_auto_unplayed == Some(true) {
                 let mut filters = q
                     .filters
@@ -2649,6 +2646,8 @@ struct UpdateItemRequest {
     tags: Option<Vec<String>>,
     genres: Option<Vec<String>>,
     people: Option<Vec<UpdateItemPerson>>,
+    locked_fields: Option<Vec<db::MetadataField>>,
+    lock_data: Option<bool>,
 }
 
 #[post("/items/{id}")]
@@ -2683,6 +2682,12 @@ pub async fn update_item(
     merge_option(&mut media.certification, &payload.official_rating, true);
     merge_option(&mut media.rating_audience, &payload.community_rating, true);
     merge_option(&mut media.rating_critic, &payload.critic_rating, true);
+    if let Some(locked_fields) = payload.locked_fields {
+        media.locked_fields = locked_fields;
+    }
+    if let Some(lock_data) = payload.lock_data {
+        media.is_locked = lock_data;
+    }
     media
         .save(
             &state
@@ -3566,6 +3571,325 @@ mod tests {
         assert!(
             !names.contains(&"Empty Provider Shows"),
             "empty smart collection must not appear in /UserViews; got: {names:?}"
+        );
+    }
+
+    // Regression: GET /Items?parentId=<alias-uuid> used db::Media::get_by_id for the parent
+    // lookup, which does a straight WHERE id = $1 and cannot follow alias mappings in the
+    // in-memory store. Stremio addons expose series under a virtual alias UUID; children are
+    // stored under the canonical UUID, so browsing returned empty. This test would have
+    // returned TotalRecordCount=0 before the fix.
+    #[tokio::test]
+    async fn parent_id_alias_resolves_children() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+        let now = Utc::now().naive_utc();
+
+        let series =
+            insert_media(db, "Alias Show", db::MediaKind::Series, "tt9000001").await;
+        let series_imdb = series
+            .external_ids
+            .imdb
+            .clone()
+            .unwrap();
+
+        let season_ext = ExternalIds {
+            series_imdb: Some(series_imdb),
+            ..Default::default()
+        };
+        let season_id = Uuid::from(&MediaIdRaw {
+            kind: db::MediaKind::Season,
+            external_ids: season_ext.clone(),
+            season: Some(1),
+            episode: None,
+        });
+        let mut season = db::Media {
+            id: season_id,
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            idx: Some(1),
+            external_ids: season_ext,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        // Mimic a Stremio addon virtual alias: store alias_uuid -> canonical series.id.
+        let alias_uuid = Uuid::new_v4();
+        guard
+            .0
+            .store
+            .save(
+                alias_uuid.to_string(),
+                series.id,
+                std::time::Duration::from_secs(3600),
+            );
+
+        let resp = server
+            .get(&format!("/users/{}/items", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[(
+                "parentId",
+                alias_uuid
+                    .to_string()
+                    .as_str(),
+            )])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0,
+            "browsing a series via its alias UUID must return children; got TotalRecordCount={}",
+            body["TotalRecordCount"]
+        );
+        assert!(
+            body["Items"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .any(|i| i["Name"] == "Season 1")
+                })
+                .unwrap_or(false),
+            "Season 1 must appear when browsing the series via its alias UUID"
+        );
+    }
+
+    // Regression: GET /items/latest?parentId=<alias-uuid> used db::Media::get_by_id for the
+    // parent lookup, so collection-level filters (IsUnplayed, sort) were silently skipped when
+    // the parent arrived via an alias UUID. This test would return all items (not just unplayed)
+    // before the fix.
+    #[tokio::test]
+    async fn items_latest_alias_applies_collection_filters() {
+        use crate::db::auth;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth_hdr = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth_hdr).await;
+        let now = Utc::now().naive_utc();
+
+        // A manual collection with auto-unplayed filtering enabled.
+        let mut collection = db::Media {
+            title: "Alias Collection".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_latest_auto_unplayed: Some(true),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        collection
+            .save(db)
+            .await
+            .unwrap();
+
+        // Two movies in the collection.
+        let movie_a =
+            insert_media(db, "Movie A", db::MediaKind::Movie, "tt8000001").await;
+        let movie_b =
+            insert_media(db, "Movie B", db::MediaKind::Movie, "tt8000002").await;
+        db::MediaRelation::add_collection_items(
+            db,
+            &collection.id,
+            &[movie_a.id, movie_b.id],
+        )
+        .await
+        .unwrap();
+
+        // Mark Movie A as played.
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let mut ms = db::UserMediaState::get_or_new(db, &user, &movie_a)
+            .await
+            .unwrap();
+        ms.play_count = 1;
+        ms.save(db)
+            .await
+            .unwrap();
+
+        // Store alias_uuid -> canonical collection.id.
+        let alias_uuid = Uuid::new_v4();
+        guard
+            .0
+            .store
+            .save(
+                alias_uuid.to_string(),
+                collection.id,
+                std::time::Duration::from_secs(3600),
+            );
+
+        let resp = server
+            .get("/items/latest")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_hdr).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    alias_uuid
+                        .to_string()
+                        .as_str(),
+                ),
+                ("userId", user_id.as_str()),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let items = body
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "IsUnplayed filter must be applied via alias UUID; expected only Movie B, got: {:?}",
+            items
+                .iter()
+                .map(|i| &i["Name"])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(items[0]["Name"], "Movie B");
+    }
+
+    // Regression: resolve_item's fast path handles Uuid aliases (store has alias→canonical Uuid).
+    // This test covers the persist_from_store path where the store holds a db::Media object
+    // (not yet a Uuid alias) — i.e. the very first time a Stremio addon series is browsed
+    // before any alias mapping has been established.
+    #[tokio::test]
+    async fn parent_id_resolves_via_persist_from_store() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth_hdr = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth_hdr).await;
+        let now = Utc::now().naive_utc();
+
+        // Build the canonical series (IMDB-derived UUID) and insert it into DB.
+        let (canonical_id, series_ext) =
+            make_content_ids(db::MediaKind::Series, "tt9000002");
+        let series_imdb = series_ext
+            .imdb
+            .clone()
+            .unwrap();
+        let mut series = db::Media {
+            id: canonical_id,
+            title: "Store Persist Show".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: series_ext.clone(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        // Season linked to the canonical series UUID.
+        let season_ext = ExternalIds {
+            series_imdb: Some(series_imdb),
+            ..Default::default()
+        };
+        let season_id = Uuid::from(&MediaIdRaw {
+            kind: db::MediaKind::Season,
+            external_ids: season_ext.clone(),
+            season: Some(1),
+            episode: None,
+        });
+        let mut season = db::Media {
+            id: season_id,
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            parent_id: Some(canonical_id),
+            grandparent_id: Some(canonical_id),
+            idx: Some(1),
+            external_ids: season_ext,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        // Mimic a Stremio addon first encounter: store a db::Media under a synthetic UUID.
+        // persist_from_store will recompute the canonical UUID from the IMDB ID, find it in DB,
+        // and return it — without any Uuid alias pre-existing in the store.
+        let alias_uuid = Uuid::new_v4();
+        let stub = db::Media {
+            id: alias_uuid,
+            title: "Store Persist Show".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: series_ext,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        guard
+            .0
+            .store
+            .save(
+                alias_uuid.to_string(),
+                stub,
+                std::time::Duration::from_secs(3600),
+            );
+
+        let resp = server
+            .get(&format!("/users/{}/items", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_hdr).unwrap(),
+            )
+            .add_query_params(&[(
+                "parentId",
+                alias_uuid
+                    .to_string()
+                    .as_str(),
+            )])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0,
+            "browsing via a store-persisted db::Media alias must return children; got TotalRecordCount={}",
+            body["TotalRecordCount"]
+        );
+        assert!(
+            body["Items"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .any(|i| i["Name"] == "Season 1"))
+                .unwrap_or(false),
+            "Season 1 must appear when browsing via a db::Media alias in the store"
         );
     }
 }

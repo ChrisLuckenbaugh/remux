@@ -246,6 +246,50 @@ pub async fn subtitles_stream(
         String,
     )>,
 ) -> Result<impl IntoResponse> {
+    subtitles_stream_inner(
+        state,
+        session,
+        item_id,
+        media_source_id,
+        stream_index,
+        format,
+    )
+    .await
+}
+
+/// Canonical Jellyfin subtitle route without the start-position-ticks segment
+/// (`/Subtitles/{index}/Stream.{format}`). Some clients — Infuse among them —
+/// synthesize this shorter form rather than the ticks-suffixed one above.
+#[get("/videos/{item_id}/{media_source_id}/subtitles/{stream_index}/stream.{format}")]
+pub async fn subtitles_stream_no_ticks(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path((item_id, media_source_id, stream_index, format)): Path<(
+        Uuid,
+        Uuid,
+        i64,
+        String,
+    )>,
+) -> Result<impl IntoResponse> {
+    subtitles_stream_inner(
+        state,
+        session,
+        item_id,
+        media_source_id,
+        stream_index,
+        format,
+    )
+    .await
+}
+
+async fn subtitles_stream_inner(
+    state: AppState,
+    session: auth::AuthSession,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    stream_index: i64,
+    format: String,
+) -> Result<impl IntoResponse> {
     // Try to resolve as an external subtitle injected during PlaybackInfo.
     // fetch_subtitles is cached (24h Stremio / SQLite Opendal) so this is cheap.
     if let Some(item_media) = db::Media::get_by_id(
@@ -761,5 +805,77 @@ pub(crate) async fn inject_external_subtitles(
                 .media_streams
                 .push(stream);
         }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use crate::integration_test::authenticated_server;
+    use http::header::HeaderValue;
+
+    /// Jellyfin's canonical subtitle route omits the start-position-ticks
+    /// segment (`/Subtitles/{index}/Stream.{format}`); some clients — Infuse
+    /// among them — request that shorter form instead of the ticks-suffixed
+    /// one this server historically only served. Both must dispatch into
+    /// the same handler rather than 404ing at the router's fallback.
+    #[tokio::test]
+    async fn canonical_route_without_ticks_dispatches_like_the_ticks_route() {
+        let (server, _guard, token) = authenticated_server().await;
+        let item_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+
+        let with_ticks = server
+            .get(&format!(
+                "/videos/{item_id}/{source_id}/subtitles/0/0/stream.vtt"
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(
+                    &crate::integration_test::auth_header_with_token(&token),
+                )
+                .unwrap(),
+            )
+            .expect_failure()
+            .await;
+
+        let without_ticks = server
+            .get(&format!(
+                "/videos/{item_id}/{source_id}/subtitles/0/stream.vtt"
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(
+                    &crate::integration_test::auth_header_with_token(&token),
+                )
+                .unwrap(),
+            )
+            .expect_failure()
+            .await;
+
+        // Neither route exists' item, so both fail — but the important thing
+        // is that the *router* matched the shorter path at all: an unmatched
+        // route falls through to the app's static-file 404, whose body is
+        // the literal text below rather than a JSON API error.
+        let fallback_body = "404 - File not found";
+        assert_ne!(
+            without_ticks.text(),
+            fallback_body,
+            "canonical route without ticks segment did not match any handler"
+        );
+        assert_eq!(
+            with_ticks
+                .status_code()
+                .is_client_error()
+                || with_ticks
+                    .status_code()
+                    .is_server_error(),
+            without_ticks
+                .status_code()
+                .is_client_error()
+                || without_ticks
+                    .status_code()
+                    .is_server_error(),
+            "both routes should fail the same way for a nonexistent item"
+        );
     }
 }

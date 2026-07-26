@@ -819,13 +819,13 @@ pub struct Stream {
     pub duration: Option<i64>,
     pub size: Option<i64>,
     pub video_hash: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<Subtitle>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub country_whitelist: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub request_headers: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub response_headers: HashMap<String, String>,
     pub parsed_file: Option<ParsedFile>,
     pub name: Option<String>,
@@ -842,6 +842,7 @@ pub struct BehaviorHints {
     pub binge_group: Option<String>,
     pub not_web_ready: Option<bool>,
     pub video_size: Option<i64>,
+    pub media_info: Option<crate::remuxdb::MediaInfo>,
 }
 
 /// AIOStreams extension: torrent sub-object within `streamData`.

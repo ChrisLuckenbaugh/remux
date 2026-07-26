@@ -387,10 +387,13 @@ pub(crate) fn apply_subtitle_delivery(
             } else {
                 "vtt"
             }
-        } else if profile_supports(SubtitleCodec::Pgs) {
-            "sup"
         } else {
-            "vtt"
+            // Image-based subtitles (PGS/DVD/DVB) have no text representation —
+            // always deliver as SUP (ffmpeg `-c:s copy -f sup`), regardless of
+            // whether the client's device profile declared PGS support. The
+            // subtitle server can only convert text codecs to vtt/srt; routing
+            // an image codec through that path (the old fallback here) 500s.
+            "sup"
         };
         let client_can_handle_image = is_image_sub
             && parsed_codec
@@ -419,5 +422,57 @@ pub(crate) fn apply_subtitle_delivery(
             stream.is_external_url = Some(false);
             stream.is_external = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod subtitle_delivery_tests {
+    use super::*;
+    use crate::api::{MediaSourceInfo, MediaStream, MediaStreamType};
+
+    /// A client that sends no DeviceProfile (Infuse's default) combined with
+    /// Extract/Strip subtitle handling used to deliver PGS/DVD/DVB subtitles
+    /// as `Stream.vtt` — a format the subtitle endpoint can only produce for
+    /// text codecs, so fetching it 500s. Image subs must always be offered
+    /// as `Stream.sup`, which the server can always produce via `-c:s copy`.
+    #[test]
+    fn image_subtitle_without_device_profile_uses_sup_not_vtt() {
+        let mut source = MediaSourceInfo {
+            id: Uuid::new_v4(),
+            media_streams: vec![MediaStream {
+                index: 2,
+                type_: Some(MediaStreamType::Subtitle),
+                codec: Some("hdmv_pgs_subtitle".to_string()),
+                is_text_subtitle_stream: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        apply_subtitle_delivery(
+            &mut source,
+            Uuid::new_v4(),
+            "test-token",
+            &None,
+            EmbeddedSubtitleHandling::Extract,
+        );
+
+        let stream = &source.media_streams[0];
+        assert_eq!(
+            stream.delivery_method,
+            Some(api::SubtitleDeliveryMethod::External)
+        );
+        let url = stream
+            .delivery_url
+            .as_deref()
+            .expect("delivery url must be set");
+        assert!(
+            url.contains("Stream.sup"),
+            "image subtitle must deliver as sup, got: {url}"
+        );
+        assert!(
+            !url.contains("Stream.vtt"),
+            "image subtitle must not deliver as vtt: {url}"
+        );
     }
 }

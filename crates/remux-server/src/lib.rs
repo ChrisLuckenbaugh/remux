@@ -159,7 +159,10 @@ pub async fn serve(config: ResolvedConfig, paths: FilesystemPaths) -> Result<()>
 /// after `grace_period` in case in-flight requests or cleanup never finish —
 /// this bounds total shutdown time for orchestrators that SIGKILL after a
 /// fixed timeout (e.g. Docker's default 10s).
-async fn shutdown_signal(shutdown_notify: Arc<tokio::sync::Notify>, grace_period: std::time::Duration) {
+async fn shutdown_signal(
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    grace_period: std::time::Duration,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -200,15 +203,20 @@ pub async fn bind_and_serve(router: Router, port: u16, ctx: AppContext) -> Resul
         delay: ctx.config.startup_retry_delay_ms,
         { tokio::net::TcpListener::bind(&addr).await }
     }?;
-    let grace_period =
-        std::time::Duration::from_secs(ctx.config.shutdown_grace_period_secs);
-    let shutdown_notify = ctx.shutdown_notify.clone();
+    let grace_period = std::time::Duration::from_secs(
+        ctx.config
+            .shutdown_grace_period_secs,
+    );
+    let shutdown_notify = ctx
+        .shutdown_notify
+        .clone();
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal(shutdown_notify, grace_period))
         .await?;
 
     info!("connections drained, running shutdown cleanup");
-    ctx.shutdown().await;
+    ctx.shutdown()
+        .await;
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&ctx.db)
         .await
@@ -224,7 +232,10 @@ pub async fn init_app(
     web_client: WebClientService,
 ) -> Result<(Router, AppContext)> {
     info!("starting remux {}", env!("CARGO_PKG_VERSION"));
-    info!("config: {}", serde_json::to_string_pretty(&*config).unwrap());
+    info!(
+        "config: {}",
+        serde_json::to_string_pretty(&*config).unwrap()
+    );
 
     // Must happen before any SDK client (TMDB/Trakt/Stremio/IntroDB/...) is
     // constructed — the shared HTTP client is built lazily on first use and
@@ -697,11 +708,32 @@ impl Default for Config {
     }
 }
 
+/// Strips a leading `/emby`-style path-segment prefix, case-insensitively.
+///
+/// Some clients (and reverse proxies mimicking Emby's app path) prefix every
+/// request with `/emby` or `/Emby`; scoped to a genuine leading path
+/// *segment* — not a bare substring search — so it can't mangle a path that
+/// merely contains "emby" elsewhere (e.g. a library item literally named
+/// "Emby"), and case-insensitive because clients disagree on casing here.
+fn strip_emby_prefix(path: &str) -> &str {
+    const PREFIX: &str = "/emby";
+    if path.len() < PREFIX.len() || !path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return path;
+    }
+    match path[PREFIX.len()..]
+        .chars()
+        .next()
+    {
+        None => "",
+        Some('/') => &path[PREFIX.len()..],
+        // "/embyfoo" — not actually the /emby prefix, just shares the letters.
+        _ => path,
+    }
+}
+
 pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
     let uri = req.uri();
-    let mut path = uri
-        .path()
-        .replace("/emby", "");
+    let mut path = strip_emby_prefix(uri.path()).to_string();
     if path.is_empty() {
         path = "/".to_string();
     }
@@ -722,15 +754,12 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
             || lower_path.starts_with("/mediasegments/")
             || lower_path.starts_with("/sessions/"));
 
-    // Smart-lowercase: only lowercase purely-alphabetic segments (route
-    // keywords like "Sessions", "Playing"). Path parameter values — UUIDs,
-    // base64 device IDs — contain digits and are preserved unchanged.
     let smart_lower_path: String = path
         .split('/')
         .map(|seg| {
             if seg
                 .chars()
-                .all(|c| c.is_ascii_alphabetic())
+                .all(|c| c.is_ascii_alphanumeric())
             {
                 seg.to_ascii_lowercase()
             } else {
@@ -766,6 +795,70 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
 
     *req.uri_mut() = new_uri;
     req
+}
+
+#[cfg(test)]
+mod uri_rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn strips_lowercase_emby_prefix() {
+        assert_eq!(strip_emby_prefix("/emby/System/Info"), "/System/Info");
+    }
+
+    /// This is the actual gap the old `String::replace("/emby", "")` had:
+    /// it only ever matched a lowercase literal, so a client (or reverse
+    /// proxy) sending `/Emby/...` fell straight through to a 404 instead of
+    /// being routed like the lowercase form.
+    #[test]
+    fn strips_mixed_case_emby_prefix() {
+        assert_eq!(strip_emby_prefix("/Emby/System/Info"), "/System/Info");
+        assert_eq!(strip_emby_prefix("/EMBY/Users/Me"), "/Users/Me");
+    }
+
+    #[test]
+    fn bare_emby_root_becomes_empty() {
+        assert_eq!(strip_emby_prefix("/emby"), "");
+        assert_eq!(strip_emby_prefix("/Emby"), "");
+    }
+
+    /// The old implementation was a global `String::replace`, so it would
+    /// mangle a path that merely *contains* "emby" anywhere — including
+    /// mid-path, not just as the leading segment. The fix only strips a
+    /// genuine leading `/emby` segment.
+    #[test]
+    fn does_not_strip_embedded_or_partial_matches() {
+        assert_eq!(
+            strip_emby_prefix("/Items/embyshow123"),
+            "/Items/embyshow123"
+        );
+        assert_eq!(strip_emby_prefix("/embyfoo/bar"), "/embyfoo/bar");
+        assert_eq!(strip_emby_prefix("/notemby/emby/x"), "/notemby/emby/x");
+    }
+
+    #[test]
+    fn path_without_emby_prefix_is_unchanged() {
+        assert_eq!(strip_emby_prefix("/Users/Me"), "/Users/Me");
+        assert_eq!(strip_emby_prefix("/"), "/");
+    }
+
+    fn rewritten_path(path_and_query: &str) -> String {
+        let req = http::Request::builder()
+            .uri(path_and_query)
+            .body(())
+            .unwrap();
+        rewrite_request_uri(req)
+            .uri()
+            .to_string()
+    }
+
+    #[test]
+    fn full_rewrite_handles_mixed_case_emby_prefix_end_to_end() {
+        assert_eq!(
+            rewritten_path("/Emby/Users/AuthenticateByName"),
+            "/users/authenticatebyname"
+        );
+    }
 }
 
 pub fn setup_logging() {
@@ -841,3 +934,52 @@ async fn handle_static_404(req: Request<Body>) -> ApiResult<impl IntoResponse> {
 
 #[cfg(test)]
 pub mod integration_test;
+
+#[cfg(test)]
+mod rewrite_uri_tests {
+    use super::rewrite_request_uri;
+
+    fn rewrite(path: &str) -> String {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(())
+            .unwrap();
+        rewrite_request_uri(req)
+            .uri()
+            .path()
+            .to_string()
+    }
+
+    #[test]
+    fn lowercases_alpha_keyword_segments() {
+        assert_eq!(rewrite("/Items/Sessions"), "/items/sessions");
+        assert_eq!(rewrite("/Genres"), "/genres");
+    }
+
+    #[test]
+    fn lowercases_keyword_with_digits() {
+        assert_eq!(rewrite("/Items/Filters2"), "/items/filters2");
+        assert_eq!(rewrite("/Hls1"), "/hls1");
+    }
+
+    #[test]
+    fn preserves_uuid_param_values() {
+        assert_eq!(
+            rewrite("/Items/f27caa37-e514-2225-cced-ed48f6553502"),
+            "/items/f27caa37-e514-2225-cced-ed48f6553502"
+        );
+        assert_eq!(
+            rewrite("/Items/F27CAA37-E514-2225-CCED-ED48F6553502"),
+            "/items/F27CAA37-E514-2225-CCED-ED48F6553502"
+        );
+    }
+
+    #[test]
+    fn leaves_special_char_device_ids_alone() {
+        let path = "/Sessions/Play/YWJjMTIz%7Cabc";
+        let rewritten = rewrite(path);
+        assert!(rewritten.starts_with("/sessions/play/"));
+        assert!(rewritten.contains("YWJjMTIz%7Cabc"));
+    }
+}

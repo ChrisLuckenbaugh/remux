@@ -18,6 +18,21 @@ use std::{
 // Heuristic metadata fallback for remote source URLs when ffprobe metadata is
 // unavailable. This keeps clients functional (stream selection/transcode
 // decisions) instead of exposing empty stream lists.
+fn container_from_extension(ext: &str) -> Option<String> {
+    match ext
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "matroska" | "mkv" => Some("mkv".to_string()),
+        "mp4" | "m4v" | "mov" => Some("mp4".to_string()),
+        "webm" => Some("webm".to_string()),
+        "avi" => Some("avi".to_string()),
+        "m2ts" | "ts" => Some("ts".to_string()),
+        "m3u8" => Some("ts".to_string()),
+        _ => None,
+    }
+}
+
 fn infer_container_from_url(url: &str) -> Option<String> {
     let path = url::Url::parse(url)
         .ok()
@@ -32,17 +47,8 @@ fn infer_container_from_url(url: &str) -> Option<String> {
         .unwrap_or(path.as_str());
     let ext = filename
         .rsplit('.')
-        .next()?
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "matroska" | "mkv" => Some("mkv".to_string()),
-        "mp4" | "m4v" | "mov" => Some("mp4".to_string()),
-        "webm" => Some("webm".to_string()),
-        "avi" => Some("avi".to_string()),
-        "m2ts" | "ts" => Some("ts".to_string()),
-        "m3u8" => Some("ts".to_string()),
-        _ => None,
-    }
+        .next()?;
+    container_from_extension(ext)
 }
 
 fn infer_video_codec(text: &str) -> Option<String> {
@@ -147,9 +153,22 @@ impl From<db::Media> for api::MediaSourceInfo {
         let is_stub = descriptor
             .and_then(|d| d.as_http_url())
             .is_none();
-        let container = descriptor
+        // Local files never carry an HTTP URL, so the descriptor gives no
+        // container/size hints unless probe_data is present. Without this,
+        // Container and Size come back null for any local file whose probe
+        // failed or was skipped — clients that gate direct play on those
+        // fields (Infuse among them) then refuse to play a source the
+        // server would otherwise happily stream.
+        let local_path = descriptor.and_then(|d| match d {
+            StreamDescriptor::Local(path) => Some(path.as_path()),
+            _ => None,
+        });
+        let url_container = descriptor
             .and_then(|d| d.as_http_url())
             .and_then(infer_container_from_url);
+        let local_size = local_path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as i64);
 
         let remux = Some(api::MediaSourceRemuxInfo {
             provider_info: source
@@ -190,6 +209,28 @@ impl From<db::Media> for api::MediaSourceInfo {
             .runtime
             .and_then(|r| r.to_ticks(common::TickUnit::Seconds));
         let run_time_ticks = probe_ticks.or(meta_ticks);
+        // Prefer whatever ffprobe already determined; fall back to the URL/
+        // local-file extension heuristics computed above only when there is
+        // no probe data (or the probe didn't capture these fields).
+        let container = source
+            .probe_data
+            .as_ref()
+            .and_then(|p| {
+                p.container
+                    .clone()
+            })
+            .or(url_container)
+            .or_else(|| {
+                local_path
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .and_then(container_from_extension)
+            });
+        let size = source
+            .probe_data
+            .as_ref()
+            .and_then(|p| p.size)
+            .or(local_size);
         let (
             mut media_streams,
             default_audio_stream_index,
@@ -276,6 +317,7 @@ impl From<db::Media> for api::MediaSourceInfo {
                     .clone(),
             ),
             container,
+            size,
             remux,
             has_segments: !is_stub,
             formats: Some(vec![]),
@@ -426,6 +468,15 @@ fn to_option_bool(flag: i64) -> Option<bool> {
 /// Convert SRT to WebVTT. Already-valid VTT is passed through unchanged.
 pub fn srt_to_vtt(input: &str) -> String {
     let input = input.trim_start_matches('\u{FEFF}');
+    // Normalize CRLF/CR to LF before block-splitting. Subtitle files from
+    // third-party addons (OpenSubtitles and friends) are frequently CRLF;
+    // block boundaries below are detected via a literal "\n\n", which never
+    // matches inside "\r\n\r\n" — so CRLF input used to collapse into one
+    // giant cue instead of being split per-block.
+    let input = input
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let input = input.as_str();
     if input
         .trim_start()
         .starts_with("WEBVTT")
@@ -483,6 +534,11 @@ pub fn srt_to_vtt(input: &str) -> String {
 
 /// Convert SRT to Jellyfin JSON TrackEvents format (1 tick = 100 ns).
 pub fn srt_to_jellyfin_json(input: &str) -> String {
+    // See the matching comment in `srt_to_vtt`: CRLF input never matches the
+    // literal "\n\n" block separator below without this normalization.
+    let input = input
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let mut events: Vec<serde_json::Value> = Vec::new();
     for block in input
         .trim()
@@ -556,4 +612,145 @@ fn srt_timestamp_to_ticks(ts: &str) -> Option<i64> {
         0
     };
     Some(((h * 3600 + m * 60 + s) * 1000 + ms) * 10_000)
+}
+
+#[cfg(test)]
+mod media_source_info_tests {
+    use super::*;
+    use crate::stream::StreamInfo;
+
+    /// A local file with no probe data (probe failed, was skipped, or hasn't
+    /// run yet) must still report Container/Size derived from the file
+    /// itself — Infuse and other direct-play clients gate playback on these
+    /// fields being present.
+    #[test]
+    fn local_file_without_probe_data_gets_container_and_size_from_disk() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("remux-test-{}.mkv", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fake mkv bytes").unwrap();
+
+        let media = db::Media {
+            title: "Local Fallback Test".to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Local(path.clone()),
+                ..Default::default()
+            }),
+            probe_data: None,
+            ..Default::default()
+        };
+
+        let info = api::MediaSourceInfo::from(media);
+
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            info.container
+                .as_deref(),
+            Some("mkv")
+        );
+        assert_eq!(info.size, Some(b"fake mkv bytes".len() as i64));
+    }
+
+    /// When probe data is present, its container/size take precedence over
+    /// the on-disk fallback — the probe result is authoritative.
+    #[test]
+    fn probe_data_container_and_size_take_precedence_over_disk() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("remux-test-{}.mkv", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fake mkv bytes").unwrap();
+
+        let media = db::Media {
+            title: "Probed Test".to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Local(path.clone()),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                container: Some("mp4".to_string()),
+                size: Some(123_456),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = api::MediaSourceInfo::from(media);
+
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            info.container
+                .as_deref(),
+            Some("mp4")
+        );
+        assert_eq!(info.size, Some(123_456));
+    }
+}
+
+#[cfg(test)]
+mod srt_conversion_tests {
+    use super::*;
+
+    const TWO_CUE_LF: &str = "1\n\
+00:00:01,000 --> 00:00:02,000\n\
+Hello there\n\
+\n\
+2\n\
+00:00:03,000 --> 00:00:04,000\n\
+Second cue\n";
+
+    /// Subtitle files served by third-party addons (OpenSubtitles and
+    /// friends) are frequently CRLF. Before the fix, the block-splitter
+    /// looked for a literal "\n\n" blank line, which never matches inside
+    /// "\r\n\r\n" — so a CRLF file collapsed into a single giant cue instead
+    /// of two, and the timestamp line never got its comma-to-dot rewrite.
+    #[test]
+    fn srt_to_vtt_splits_crlf_cues_same_as_lf() {
+        let crlf = TWO_CUE_LF.replace('\n', "\r\n");
+
+        let lf_result = srt_to_vtt(TWO_CUE_LF);
+        let crlf_result = srt_to_vtt(&crlf);
+
+        assert!(
+            lf_result.contains("Hello there") && lf_result.contains("Second cue"),
+            "sanity: LF input should already split into two cues: {lf_result}"
+        );
+        assert!(
+            crlf_result.contains("Hello there") && crlf_result.contains("Second cue"),
+            "CRLF input must split into the same two cues, got: {crlf_result}"
+        );
+        assert!(
+            crlf_result.contains("00:00:01.000 --> 00:00:02.000"),
+            "CRLF timestamp must still get comma-to-dot rewrite: {crlf_result}"
+        );
+    }
+
+    #[test]
+    fn srt_to_jellyfin_json_splits_crlf_cues_same_as_lf() {
+        let crlf = TWO_CUE_LF.replace('\n', "\r\n");
+
+        let lf_json = srt_to_jellyfin_json(TWO_CUE_LF);
+        let crlf_json = srt_to_jellyfin_json(&crlf);
+
+        let lf_events: serde_json::Value = serde_json::from_str(&lf_json).unwrap();
+        let crlf_events: serde_json::Value = serde_json::from_str(&crlf_json).unwrap();
+
+        assert_eq!(
+            lf_events["TrackEvents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "sanity: LF input should produce two TrackEvents"
+        );
+        assert_eq!(
+            crlf_events["TrackEvents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "CRLF input must produce the same two TrackEvents, got: {crlf_json}"
+        );
+    }
 }

@@ -1164,7 +1164,6 @@ pub async fn add_session_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Remove an additional user from a session.
 #[delete("/sessions/{sessionid}/user/{userid}")]
 pub async fn remove_session_user(
     State(_state): State<AppState>,

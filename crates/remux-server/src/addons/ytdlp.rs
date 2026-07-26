@@ -387,7 +387,10 @@ impl YtDlpAddon {
                 url_or_query,
             ])
             .args(self.cookies_args())
-            .args(self.ytdlp_extra_args.clone())
+            .args(
+                self.ytdlp_extra_args
+                    .clone(),
+            )
             .args(self.bgutil_args())
             .output()
             .await
@@ -476,7 +479,10 @@ impl YtDlpAddon {
                 url_or_query,
             ])
             .args(self.cookies_args())
-            .args(self.ytdlp_extra_args.clone())
+            .args(
+                self.ytdlp_extra_args
+                    .clone(),
+            )
             .args(self.bgutil_args())
             .output()
             .await
@@ -538,7 +544,10 @@ impl YtDlpAddon {
                 &url,
             ])
             .args(self.cookies_args())
-            .args(self.ytdlp_extra_args.clone())
+            .args(
+                self.ytdlp_extra_args
+                    .clone(),
+            )
             .args(self.bgutil_args())
             .output()
             .await
@@ -687,7 +696,10 @@ impl YtDlpAddon {
                 &search_url,
             ])
             .args(self.cookies_args())
-            .args(self.ytdlp_extra_args.clone())
+            .args(
+                self.ytdlp_extra_args
+                    .clone(),
+            )
             .args(self.bgutil_args())
             .output()
             .await
@@ -748,7 +760,10 @@ impl YtDlpAddon {
                             &url,
                         ])
                         .args(&cookies_args)
-                        .args(self.ytdlp_extra_args.clone())
+                        .args(
+                            self.ytdlp_extra_args
+                                .clone(),
+                        )
                         .args(self.bgutil_args())
                         .output()
                         .await
