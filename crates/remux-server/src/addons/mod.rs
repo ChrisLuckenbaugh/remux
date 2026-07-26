@@ -2296,6 +2296,41 @@ fn match_probe_version<'a>(
         })
 }
 
+/// Two-tier stream freshness: items whose last fetch stored streams are
+/// stable for `STREAMS_TTL_SECS`, while items whose last fetch produced
+/// nothing (including upstream rate-limit errors, which are dropped before
+/// persisting) retry after `STREAMS_EMPTY_TTL_SECS` so new releases and
+/// recovered upstreams still fill in quickly.
+async fn streams_are_fresh(
+    db: &sqlx::SqlitePool,
+    media_id: Uuid,
+    refreshed_at: Option<chrono::NaiveDateTime>,
+) -> bool {
+    const STREAMS_TTL_SECS: i64 = 6 * 60 * 60;
+    const STREAMS_EMPTY_TTL_SECS: i64 = 5 * 60;
+
+    let Some(age_secs) =
+        refreshed_at.map(|r| (chrono::Utc::now().naive_utc() - r).num_seconds())
+    else {
+        return false;
+    };
+    if age_secs < STREAMS_EMPTY_TTL_SECS {
+        return true;
+    }
+    if age_secs >= STREAMS_TTL_SECS {
+        return false;
+    }
+    // Between the tiers: fresh only if the last fetch actually stored streams.
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM media WHERE kind = 'stream' AND parent_id = ?)",
+    )
+    .bind(media_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0)
+        != 0
+}
+
 impl AddonService {
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
@@ -2304,16 +2339,10 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        const STREAMS_TTL_SECS: i64 = 60;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
-        let is_fresh = |refreshed: Option<chrono::NaiveDateTime>| {
-            refreshed.is_some_and(|r| {
-                (chrono::Utc::now().naive_utc() - r).num_seconds() < STREAMS_TTL_SECS
-            })
-        };
-        if is_fresh(media.streams_refreshed_at) {
+        if streams_are_fresh(&ctx.db, media.id, media.streams_refreshed_at).await {
             return Ok(());
         }
 
@@ -2332,10 +2361,20 @@ impl AddonService {
         .ok()
         .flatten()
         .flatten();
-        if is_fresh(refreshed_at) {
+        if streams_are_fresh(&ctx.db, media.id, refreshed_at).await {
             media.streams_refreshed_at = refreshed_at;
             return Ok(());
         }
+
+        // Bound simultaneous upstream fan-outs: a client prefetching a whole
+        // season would otherwise burst one live addon fan-out per episode and
+        // trip the public addons' per-IP rate limits.
+        static STREAM_FETCH_PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> =
+            std::sync::OnceLock::new();
+        let _permit = STREAM_FETCH_PERMITS
+            .get_or_init(|| tokio::sync::Semaphore::new(4))
+            .acquire()
+            .await?;
 
         let instant = Instant::now();
         let probe_versions_fut = async {
@@ -2424,10 +2463,10 @@ impl AddonService {
                 .collect()
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
-        if deduped.is_empty() {
-            return Ok(());
-        }
 
+        // Stamp even when the fetch produced nothing: streams_are_fresh()'s
+        // empty tier then backs off retries instead of refetching (and
+        // re-hitting rate-limited upstreams) on every request.
         let now = chrono::Utc::now().naive_utc();
         sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
             .bind(now)
@@ -2435,6 +2474,9 @@ impl AddonService {
             .execute(&ctx.db)
             .await?;
         media.streams_refreshed_at = Some(now);
+        if deduped.is_empty() {
+            return Ok(());
+        }
         let mut sources: Vec<db::Media> = deduped
             .into_iter()
             .enumerate()
