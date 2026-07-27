@@ -1,0 +1,30 @@
+# Slim, direct-play-only remux image: a static musl binary on distroless.
+# No ffmpeg, no yt-dlp, no GPU stack — transcoding and YouTube playback are
+# unavailable. Intended for debrid/direct-play deployments (e.g. Infuse).
+#
+# Build the binary first (CI or locally):
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl -p remux-server --no-default-features
+#
+# Then, with jellyfin-web/ and dashboard/ built as for the main Dockerfile:
+#   docker build -f docker/Dockerfile.slim -t remux:slim .
+
+# distroless/static ships CA certificates, tzdata and a nonroot user;
+# the binary is fully static so no libc is needed.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ENV WEB_PATH=/app/jellyfin-web
+ENV DASHBOARD_PATH=/app/dashboard
+ENV DATABASE_URL=sqlite:///data/db.sqlite?mode=rwc
+ENV TORRENT_DATA_DIR=/data/torrents
+ENV DATA_DIR=/data
+
+WORKDIR /app
+
+COPY --chown=nonroot:nonroot target/x86_64-unknown-linux-musl/release/remux-server .
+COPY --chown=nonroot:nonroot dashboard ./dashboard
+COPY --chown=nonroot:nonroot jellyfin-web ./jellyfin-web
+
+EXPOSE 3000
+
+ENTRYPOINT ["/app/remux-server"]
